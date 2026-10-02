@@ -1,313 +1,172 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const cors = require("cors");
 
 const app = express();
 const server = http.createServer(app);
 
 const wss = new WebSocket.Server({
-    server
+    server,
+    path: "/tunnel"
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Only one ESP32 tunnel for now
+let esp32 = null;
 
-// Admin website
 app.use(express.static("public"));
 
-// Connected ESP32 devices
-const devices = new Map();
-
-
-// ========================================
-// SERVER STATUS
-// ========================================
+/*
+============================================================
+STATUS
+============================================================
+*/
 
 app.get("/api/status", (req, res) => {
 
     res.json({
-        server: "ESP32 Cloud Server",
-        status: "online",
-        devices: devices.size,
+        server: "ESP32 Reverse Tunnel",
+        esp32Connected:
+            esp32 !== null &&
+            esp32.readyState === WebSocket.OPEN,
         time: new Date().toISOString()
     });
 
 });
 
-
-// ========================================
-// GET DEVICES
-// ========================================
-
-app.get("/api/devices", (req, res) => {
-
-    const deviceList = [];
-
-    for (const [deviceId, device] of devices) {
-
-        deviceList.push({
-            deviceId: deviceId,
-            relay1: device.relay1,
-            relay2: device.relay2,
-            relay3: device.relay3,
-            connected: true,
-            lastSeen: device.lastSeen
-        });
-
-    }
-
-    res.json(deviceList);
-
-});
-
-
-// ========================================
-// WEBSOCKET CONNECTION
-// ========================================
+/*
+============================================================
+WEBSOCKET TUNNEL
+============================================================
+*/
 
 wss.on("connection", (ws) => {
 
-    console.log("WebSocket client connected");
+    console.log("ESP32 tunnel connected");
 
-    let deviceId = null;
+    // Replace old connection
+    if (esp32) {
 
+        try {
+            esp32.close();
+        } catch (e) {}
 
-    // ------------------------------------
-    // RECEIVE MESSAGE
-    // ------------------------------------
+    }
+
+    esp32 = ws;
+
+    ws.send(JSON.stringify({
+        type: "connected",
+        message: "Tunnel established"
+    }));
 
     ws.on("message", (message) => {
 
-        try {
-
-            const data = JSON.parse(message);
-
-            console.log("Received:", data);
-
-
-            // ==============================
-            // DEVICE REGISTER
-            // ==============================
-
-            if (data.type === "register") {
-
-                deviceId = data.deviceId;
-
-                devices.set(deviceId, {
-
-                    ws: ws,
-
-                    deviceId: deviceId,
-
-                    relay1: false,
-
-                    relay2: false,
-
-                    relay3: false,
-
-                    lastSeen: Date.now()
-
-                });
-
-                ws.send(JSON.stringify({
-
-                    type: "registered",
-
-                    deviceId: deviceId
-
-                }));
-
-                console.log(
-                    "ESP32 registered:",
-                    deviceId
-                );
-
-            }
-
-
-            // ==============================
-            // STATUS UPDATE
-            // ==============================
-
-            if (data.type === "status") {
-
-                if (deviceId && devices.has(deviceId)) {
-
-                    const device =
-                        devices.get(deviceId);
-
-                    device.relay1 =
-                        Boolean(data.relay1);
-
-                    device.relay2 =
-                        Boolean(data.relay2);
-
-                    device.relay3 =
-                        Boolean(data.relay3);
-
-                    device.lastSeen =
-                        Date.now();
-
-                    devices.set(
-                        deviceId,
-                        device
-                    );
-
-                }
-
-            }
-
-
-            // ==============================
-            // HEARTBEAT
-            // ==============================
-
-            if (data.type === "heartbeat") {
-
-                if (deviceId && devices.has(deviceId)) {
-
-                    devices.get(deviceId).lastSeen =
-                        Date.now();
-
-                }
-
-            }
-
-        } catch (error) {
-
-            console.log(
-                "Invalid WebSocket message:",
-                error.message
-            );
-
-        }
+        console.log(
+            "Received from ESP32:",
+            message.toString()
+        );
 
     });
-
-
-    // ------------------------------------
-    // DISCONNECT
-    // ------------------------------------
 
     ws.on("close", () => {
 
-        console.log(
-            "WebSocket disconnected:",
-            deviceId
-        );
+        console.log("ESP32 tunnel disconnected");
 
-        if (deviceId) {
-
-            devices.delete(deviceId);
-
+        if (esp32 === ws) {
+            esp32 = null;
         }
 
     });
 
-});
+    ws.on("error", (error) => {
 
-
-// ========================================
-// SEND RELAY COMMAND
-// ========================================
-
-app.post("/api/relay", (req, res) => {
-
-    const {
-        deviceId,
-        relay,
-        state
-    } = req.body;
-
-
-    // Check device ID
-    if (!deviceId) {
-
-        return res.status(400).json({
-
-            success: false,
-
-            error: "deviceId is required"
-
-        });
-
-    }
-
-
-    // Check relay number
-    if (![1, 2, 3].includes(Number(relay))) {
-
-        return res.status(400).json({
-
-            success: false,
-
-            error: "Relay must be 1, 2 or 3"
-
-        });
-
-    }
-
-
-    // Check device
-    if (!devices.has(deviceId)) {
-
-        return res.status(404).json({
-
-            success: false,
-
-            error: "ESP32 is offline"
-
-        });
-
-    }
-
-
-    const device =
-        devices.get(deviceId);
-
-
-    // Command
-    const command = {
-
-        type: "relay",
-
-        relay: Number(relay),
-
-        state: Boolean(state)
-
-    };
-
-
-    // Send to ESP32
-    device.ws.send(
-        JSON.stringify(command)
-    );
-
-
-    console.log(
-        "Relay command:",
-        command
-    );
-
-
-    res.json({
-
-        success: true,
-
-        command: command
+        console.log(
+            "ESP32 WebSocket error:",
+            error.message
+        );
 
     });
 
 });
 
+/*
+============================================================
+HOME
+============================================================
+*/
 
-// ========================================
-// START SERVER
-// ========================================
+app.get("/", (req, res) => {
+
+    if (
+        !esp32 ||
+        esp32.readyState !== WebSocket.OPEN
+    ) {
+
+        return res.status(503).send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Offline</title>
+</head>
+
+<body style="
+    background:#080c15;
+    color:white;
+    font-family:Arial;
+    text-align:center;
+    padding-top:100px;
+">
+
+    <h1>ESP32 Offline</h1>
+
+    <p>
+        The ESP32 has not connected to the cloud tunnel yet.
+    </p>
+
+</body>
+</html>
+        `);
+
+    }
+
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Tunnel</title>
+</head>
+
+<body style="
+    background:#080c15;
+    color:white;
+    font-family:Arial;
+    text-align:center;
+    padding-top:100px;
+">
+
+    <h1>ESP32 Connected</h1>
+
+    <p>
+        Cloud tunnel is active.
+    </p>
+
+    <p>
+        Next step will forward the ESP32 WebServer.
+    </p>
+
+</body>
+</html>
+    `);
+
+});
+
+/*
+============================================================
+SERVER
+============================================================
+*/
 
 server.listen(
     PORT,
@@ -315,7 +174,7 @@ server.listen(
     () => {
 
         console.log(
-            `ESP32 Cloud Server running on port ${PORT}`
+            `Tunnel server running on port ${PORT}`
         );
 
     }
