@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>ESP32 Relay Admin</title>
+
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+
+            margin: 0;
+
+            font-family:
+                Arial,
+                Helvetica,
+                sans-serif;
+
+            background: #0f172a;
+
+            color: white;
+
+            min-height: 100vh;
+
+            padding: 30px;
+
+        }
+
+
+        .container {
+
+            max-width: 900px;
+
+            margin: auto;
+
+        }
+
+
+        h1 {
+
+            margin-bottom: 5px;
+
+        }
+
+
+        .subtitle {
+
+            color: #94a3b8;
+
+            margin-bottom: 30px;
+
+        }
+
+
+        .status-card {
+
+            background: #1e293b;
+
+            border-radius: 15px;
+
+            padding: 20px;
+
+            margin-bottom: 20px;
+
+        }
+
+
+        .status {
+
+            display: flex;
+
+            align-items: center;
+
+            gap: 10px;
+
+        }
+
+
+        .dot {
+
+            width: 12px;
+
+            height: 12px;
+
+            border-radius: 50%;
+
+            background: #ef4444;
+
+        }
+
+
+        .dot.online {
+
+            background: #22c55e;
+
+        }
+
+
+        .device-card {
+
+            background: #1e293b;
+
+            border-radius: 15px;
+
+            padding: 25px;
+
+        }
+
+
+        .device-header {
+
+            display: flex;
+
+            justify-content: space-between;
+
+            align-items: center;
+
+            margin-bottom: 25px;
+
+        }
+
+
+        .device-id {
+
+            font-size: 20px;
+
+            font-weight: bold;
+
+        }
+
+
+        .online {
+
+            color: #22c55e;
+
+        }
+
+
+        .offline {
+
+            color: #ef4444;
+
+        }
+
+
+        .relay {
+
+            display: flex;
+
+            justify-content: space-between;
+
+            align-items: center;
+
+            padding: 18px 0;
+
+            border-bottom: 1px solid #334155;
+
+        }
+
+
+        .relay:last-child {
+
+            border-bottom: none;
+
+        }
+
+
+        .relay-name {
+
+            font-size: 18px;
+
+        }
+
+
+        .buttons {
+
+            display: flex;
+
+            gap: 10px;
+
+        }
+
+
+        button {
+
+            border: none;
+
+            padding: 10px 20px;
+
+            border-radius: 8px;
+
+            cursor: pointer;
+
+            font-weight: bold;
+
+            color: white;
+
+        }
+
+
+        .on {
+
+            background: #16a34a;
+
+        }
+
+
+        .off {
+
+            background: #dc2626;
+
+        }
+
+
+        button:hover {
+
+            opacity: 0.85;
+
+        }
+
+
+        #message {
+
+            margin-top: 20px;
+
+            padding: 15px;
+
+            border-radius: 10px;
+
+            display: none;
+
+            background: #334155;
+
+        }
+
+
+        @media (max-width: 600px) {
+
+            body {
+
+                padding: 15px;
+
+            }
+
+            .relay {
+
+                flex-direction: column;
+
+                align-items: flex-start;
+
+                gap: 15px;
+
+            }
+
+        }
+
+    </style>
+
+</head>
+
+
+<body>
+
+
+<div class="container">
+
+
+    <h1>ESP32 Relay Admin</h1>
+
+    <div class="subtitle">
+
+        Remote Relay Control Panel
+
+    </div>
+
+
+    <!-- SERVER STATUS -->
+
+    <div class="status-card">
+
+        <div class="status">
+
+            <div
+                id="serverDot"
+                class="dot"
+            ></div>
+
+            <span id="serverStatus">
+
+                Checking server...
+
+            </span>
+
+        </div>
+
+    </div>
+
+
+    <!-- DEVICE -->
+
+    <div class="device-card">
+
+        <div class="device-header">
+
+            <div>
+
+                <div class="device-id">
+
+                    ESP32_001
+
+                </div>
+
+                <div id="deviceStatus">
+
+                    Checking...
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <!-- RELAY 1 -->
+
+        <div class="relay">
+
+            <div class="relay-name">
+
+                Relay 1
+
+            </div>
+
+            <div class="buttons">
+
+                <button
+                    class="on"
+                    onclick="controlRelay(1, true)"
+                >
+
+                    ON
+
+                </button>
+
+                <button
+                    class="off"
+                    onclick="controlRelay(1, false)"
+                >
+
+                    OFF
+
+                </button>
+
+            </div>
+
+        </div>
+
+
+        <!-- RELAY 2 -->
+
+        <div class="relay">
+
+            <div class="relay-name">
+
+                Relay 2
+
+            </div>
+
+            <div class="buttons">
+
+                <button
+                    class="on"
+                    onclick="controlRelay(2, true)"
+                >
+
+                    ON
+
+                </button>
+
+                <button
+                    class="off"
+                    onclick="controlRelay(2, false)"
+                >
+
+                    OFF
+
+                </button>
+
+            </div>
+
+        </div>
+
+
+        <!-- RELAY 3 -->
+
+        <div class="relay">
+
+            <div class="relay-name">
+
+                Relay 3
+
+            </div>
+
+            <div class="buttons">
+
+                <button
+                    class="on"
+                    onclick="controlRelay(3, true)"
+                >
+
+                    ON
+
+                </button>
+
+                <button
+                    class="off"
+                    onclick="controlRelay(3, false)"
+                >
+
+                    OFF
+
+                </button>
+
+            </div>
+
+        </div>
+
+
+        <div id="message"></div>
+
+    </div>
+
+</div>
+
+
+<script>
+
+
+// ========================================
+// CONFIGURATION
+// ========================================
+
+const DEVICE_ID = "ESP32_001";
+
+
+// ========================================
+// CHECK SERVER
+// ========================================
+
+async function checkServer() {
+
+    try {
+
+        const response =
+            await fetch("/api/status");
+
+        const data =
+            await response.json();
+
+
+        document.getElementById(
+            "serverStatus"
+        ).innerText =
+            "Server online | Devices: " +
+            data.devices;
+
+
+        document.getElementById(
+            "serverDot"
+        ).classList.add("online");
+
+
+    } catch (error) {
+
+        document.getElementById(
+            "serverStatus"
+        ).innerText =
+            "Server offline";
+
+
+        document.getElementById(
+            "serverDot"
+        ).classList.remove("online");
+
+    }
+
+}
+
+
+// ========================================
+// CHECK ESP32
+// ========================================
+
+async function checkDevice() {
+
+    try {
+
+        const response =
+            await fetch("/api/devices");
+
+        const devices =
+            await response.json();
+
+
+        const device =
+            devices.find(
+                d => d.deviceId === DEVICE_ID
+            );
+
+
+        const status =
+            document.getElementById(
+                "deviceStatus"
+            );
+
+
+        if (device) {
+
+            status.innerText =
+                "● Connected";
+
+            status.className =
+                "online";
+
+        } else {
+
+            status.innerText =
+                "● Offline";
+
+            status.className =
+                "offline";
+
+        }
+
+    } catch (error) {
+
+        console.log(error);
+
+    }
+
+}
+
+
+// ========================================
+// CONTROL RELAY
+// ========================================
+
+async function controlRelay(
+    relay,
+    state
+) {
+
+    const message =
+        document.getElementById(
+            "message"
+        );
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/relay",
+                {
+
+                    method: "POST",
+
+                    headers: {
+
+                        "Content-Type":
+                            "application/json"
+
+                    },
+
+                    body: JSON.stringify({
+
+                        deviceId:
+                            DEVICE_ID,
+
+                        relay:
+                            relay,
+
+                        state:
+                            state
+
+                    })
+
+                }
+            );
+
+
+        const data =
+            await response.json();
+
+
+        message.style.display =
+            "block";
+
+
+        if (data.success) {
+
+            message.innerText =
+                "Relay " +
+                relay +
+                " command sent: " +
+                (state ? "ON" : "OFF");
+
+        } else {
+
+            message.innerText =
+                data.error;
+
+        }
+
+
+        setTimeout(() => {
+
+            message.style.display =
+                "none";
+
+        }, 3000);
+
+
+    } catch (error) {
+
+        message.style.display =
+            "block";
+
+        message.innerText =
+            "Unable to contact server";
+
+    }
+
+}
+
+
+// ========================================
+// AUTO REFRESH
+// ========================================
+
+checkServer();
+
+checkDevice();
+
+
+setInterval(
+    checkServer,
+    5000
+);
+
+
+setInterval(
+    checkDevice,
+    3000
+);
+
+
+</script>
+
+
+</body>
+
+</html>
