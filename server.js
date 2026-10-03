@@ -5,6 +5,10 @@ const WebSocket = require("ws");
 const app = express();
 const server = http.createServer(app);
 
+// Keep proxied HTTP connections stable during longer ESP32 operations.
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
+
 const wss = new WebSocket.Server({
     server,
     path: "/tunnel",
@@ -14,12 +18,13 @@ const wss = new WebSocket.Server({
 let esp32 = null;
 const pending = new Map();
 
+// WebSocket heartbeat/health tracking.
+const HEARTBEAT_INTERVAL = 30000;
+const HEARTBEAT_TIMEOUT = 10000;
+
 function clearPending(id) {
     const item = pending.get(id);
-
-    if (!item) {
-        return null;
-    }
+    if (!item) return null;
 
     clearTimeout(item.timer);
     pending.delete(id);
@@ -30,9 +35,7 @@ function clearPending(id) {
 function failPending(id, status, message) {
     const item = clearPending(id);
 
-    if (!item) {
-        return;
-    }
+    if (!item) return;
 
     if (!item.res.headersSent) {
         item.res
@@ -46,9 +49,7 @@ function failPending(id, status, message) {
 }
 
 function sendPendingResponse(id, item, body) {
-    if (!item || item.finished) {
-        return;
-    }
+    if (!item || item.finished) return;
 
     item.finished = true;
 
@@ -127,35 +128,43 @@ function sendPendingResponse(id, item, body) {
 }
 
 function sendWs(ws, payload) {
-    return new Promise((resolve, reject) => {
-        if (
-            !ws ||
-            ws.readyState !==
-                WebSocket.OPEN
-        ) {
-            reject(
-                new Error(
-                    "ESP32 WebSocket is not connected"
-                )
-            );
-            return;
-        }
+    return new Promise(
+        (resolve, reject) => {
+            if (
+                !ws ||
+                ws.readyState !==
+                    WebSocket.OPEN
+            ) {
+                reject(
+                    new Error(
+                        "ESP32 WebSocket is not connected"
+                    )
+                );
 
-        ws.send(
-            JSON.stringify(payload),
-            (err) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve();
-                }
+                return;
             }
-        );
-    });
+
+            ws.send(
+                JSON.stringify(payload),
+                (err) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                }
+            );
+        }
+    );
 }
 
 // ============================================================
 // MULTIPART FILE PARSER
+// ============================================================
+//
+// Used by the existing /upload form.
+// Render extracts the file before sending it to ESP32.
+//
 // ============================================================
 
 function parseMultipartFile(
@@ -170,7 +179,9 @@ function parseMultipartFile(
 
     const match =
         /boundary=(?:"([^"]+)"|([^;]+))/i
-            .exec(contentType || "");
+            .exec(
+                contentType || ""
+            );
 
     if (!match) {
         throw new Error(
@@ -181,19 +192,20 @@ function parseMultipartFile(
     const boundary =
         match[1] || match[2];
 
-    const marker = Buffer.from(
-        `--${boundary}`,
-        "utf8"
-    );
+    const marker =
+        Buffer.from(
+            `--${boundary}`,
+            "utf8"
+        );
 
     let cursor =
         body.indexOf(marker);
 
     while (cursor >= 0) {
-        let partStart =
+        const partStart =
             cursor + marker.length;
 
-        // Multipart finished
+        // End of multipart body.
         if (
             body
                 .slice(
@@ -210,15 +222,19 @@ function parseMultipartFile(
             partStart;
 
         if (
-            body[headerStart] === 0x0d &&
-            body[headerStart + 1] === 0x0a
+            body[headerStart] ===
+                0x0d &&
+            body[headerStart + 1] ===
+                0x0a
         ) {
             headerStart += 2;
         }
 
         const headerEnd =
             body.indexOf(
-                Buffer.from("\r\n\r\n"),
+                Buffer.from(
+                    "\r\n\r\n"
+                ),
                 headerStart
             );
 
@@ -238,7 +254,9 @@ function parseMultipartFile(
 
         const disposition =
             /content-disposition:\s*([^\r\n]+)/i
-                .exec(headersText);
+                .exec(
+                    headersText
+                );
 
         if (disposition) {
             const value =
@@ -263,7 +281,9 @@ function parseMultipartFile(
                         dataStart
                     );
 
-                if (nextBoundary < 0) {
+                if (
+                    nextBoundary < 0
+                ) {
                     throw new Error(
                         "Multipart closing boundary not found"
                     );
@@ -334,11 +354,13 @@ async function handleCloudUpload(
     let file;
 
     try {
-        file = parseMultipartFile(
-            req.body,
-            req.headers["content-type"] ||
-                ""
-        );
+        file =
+            parseMultipartFile(
+                req.body,
+                req.headers[
+                    "content-type"
+                ] || ""
+            );
     } catch (error) {
         console.error(
             "[CLOUD UPLOAD] Multipart parse error:",
@@ -347,7 +369,9 @@ async function handleCloudUpload(
 
         return res
             .status(400)
-            .send(error.message);
+            .send(
+                error.message
+            );
     }
 
     const id =
@@ -361,38 +385,44 @@ async function handleCloudUpload(
         );
 
     const timer =
-        setTimeout(() => {
-            const item =
-                pending.get(id);
+        setTimeout(
+            () => {
+                const item =
+                    pending.get(id);
 
-            if (!item) {
-                return;
-            }
+                if (!item) {
+                    return;
+                }
 
-            pending.delete(id);
+                pending.delete(id);
 
-            if (!res.headersSent) {
-                res
-                    .status(504)
-                    .send(
-                        "ESP32 upload timeout"
-                    );
-            }
+                if (!res.headersSent) {
+                    res
+                        .status(504)
+                        .send(
+                            "ESP32 upload timeout"
+                        );
+                }
 
-            console.log(
-                "[CLOUD UPLOAD] Timeout:",
-                id
-            );
-        }, 60000);
+                console.log(
+                    "[CLOUD UPLOAD] Timeout:",
+                    id
+                );
+            },
+            60000
+        );
 
-    pending.set(id, {
-        res,
-        timer,
-        finished: false,
-        statusCode: 200,
-        headers: {},
-        chunks: []
-    });
+    pending.set(
+        id,
+        {
+            res,
+            timer,
+            finished: false,
+            statusCode: 200,
+            headers: {},
+            chunks: []
+        }
+    );
 
     try {
         console.log(
@@ -402,19 +432,24 @@ async function handleCloudUpload(
             file.data.length
         );
 
-        // Tell ESP32 a file upload is starting
+        // Start upload on ESP32.
         await sendWs(
             esp32,
             {
-                type: "upload_start",
+                type:
+                    "upload_start",
+
                 id,
+
                 filename:
                     file.filename,
+
                 cookie
             }
         );
 
-        // Keep WebSocket messages small
+        // Keep chunks small enough
+        // for ESP32 memory.
         const CHUNK_SIZE = 768;
 
         let sequence = 0;
@@ -453,7 +488,7 @@ async function handleCloudUpload(
             );
         }
 
-        // Tell ESP32 upload is complete
+        // Tell ESP32 the upload is complete.
         await sendWs(
             esp32,
             {
@@ -485,403 +520,459 @@ async function handleCloudUpload(
 // ESP32 WEBSOCKET
 // ============================================================
 
-wss.on("connection", (ws) => {
-    console.log(
-        "[WS] ESP32 socket connected"
-    );
+wss.on(
+    "connection",
+    (ws) => {
+        console.log(
+            "[WS] ESP32 socket connected"
+        );
 
-    ws.on("message", (message) => {
-        try {
-            const data =
-                JSON.parse(
-                    message.toString()
-                );
+        ws.isAlive = true;
+        ws.lastHeartbeat =
+            Date.now();
 
-            if (
-                data.type !==
-                "response_chunk"
-            ) {
-                console.log(
-                    "[ESP32 -> RENDER]",
-                    data.type
-                );
-            }
-
-            // =================================================
-            // ESP32 REGISTER
-            // =================================================
-
-            if (
-                data.type ===
-                "esp32"
-            ) {
-                if (
-                    esp32 &&
-                    esp32 !== ws
-                ) {
-                    try {
-                        esp32.close();
-                    } catch {}
-                }
-
-                esp32 = ws;
-
-                console.log(
-                    "[WS] ESP32 registered"
-                );
-
-                ws.send(
-                    JSON.stringify({
-                        type:
-                            "registered"
-                    })
-                );
-
-                return;
-            }
-
-            // =================================================
-            // LEGACY RESPONSE
-            // =================================================
-
-            if (
-                data.type ===
-                "response"
-            ) {
-                const item =
-                    pending.get(
-                        data.id
-                    );
-
-                if (!item) {
-                    return;
-                }
-
-                let body;
-
+        ws.on(
+            "message",
+            (message) => {
                 try {
-                    body =
-                        Buffer.from(
-                            data.body ||
-                                "",
-                            "base64"
+                    const data =
+                        JSON.parse(
+                            message.toString()
                         );
-                } catch {
-                    failPending(
-                        data.id,
-                        502,
-                        "Invalid response body from ESP32"
-                    );
 
-                    return;
-                }
-
-                item.statusCode =
-                    Number(
-                        data.statusCode ||
-                            200
-                    );
-
-                item.headers =
-                    data.headers || {};
-
-                sendPendingResponse(
-                    data.id,
-                    item,
-                    body
-                );
-
-                return;
-            }
-
-            // =================================================
-            // RESPONSE START
-            // =================================================
-
-            if (
-                data.type ===
-                "response_start"
-            ) {
-                const item =
-                    pending.get(
-                        data.id
-                    );
-
-                if (!item) {
-                    return;
-                }
-
-                item.statusCode =
-                    Number(
-                        data.statusCode ||
-                            200
-                    );
-
-                item.headers =
-                    data.headers || {};
-
-                item.expectedLength =
-                    Number.isFinite(
-                        Number(
-                            data.expectedLength
-                        )
-                    )
-                        ? Number(
-                              data.expectedLength
-                          )
-                        : -1;
-
-                item.chunks = [];
-                item.receivedBytes = 0;
-                item.finished = false;
-
-                console.log(
-                    "[TUNNEL] Response start",
-                    item.statusCode,
-                    "expected:",
-                    item.expectedLength,
-                    "id:",
-                    data.id
-                );
-
-                return;
-            }
-
-            // =================================================
-            // RESPONSE CHUNK
-            // =================================================
-
-            if (
-                data.type ===
-                "response_chunk"
-            ) {
-                const item =
-                    pending.get(
-                        data.id
-                    );
-
-                if (
-                    !item ||
-                    item.finished
-                ) {
-                    return;
-                }
-
-                let chunk;
-
-                try {
-                    chunk =
-                        Buffer.from(
-                            data.body ||
-                                "",
-                            "base64"
-                        );
-                } catch {
-                    failPending(
-                        data.id,
-                        502,
-                        "Invalid response chunk from ESP32"
-                    );
-
-                    return;
-                }
-
-                if (
-                    chunk.length > 0
-                ) {
-                    item.chunks.push(
-                        chunk
-                    );
-
-                    item.receivedBytes +=
-                        chunk.length;
-                }
-
-                return;
-            }
-
-            // =================================================
-            // RESPONSE END
-            // =================================================
-
-            if (
-                data.type ===
-                "response_end"
-            ) {
-                const item =
-                    pending.get(
-                        data.id
-                    );
-
-                if (
-                    !item ||
-                    item.finished
-                ) {
-                    return;
-                }
-
-                const body =
-                    Buffer.concat(
-                        item.chunks || []
-                    );
-
-                console.log(
-                    "[TUNNEL] Response end",
-                    "received:",
-                    body.length,
-                    "reported:",
-                    Number(
-                        data.totalBytes || 0
-                    ),
-                    "expected:",
-                    item.expectedLength,
-                    "id:",
-                    data.id
-                );
-
-                sendPendingResponse(
-                    data.id,
-                    item,
-                    body
-                );
-
-                return;
-            }
-
-            // =================================================
-            // CLOUD UPLOAD COMPLETE RESPONSE
-            // =================================================
-
-            if (
-                data.type ===
-                "upload_response"
-            ) {
-                const item =
-                    pending.get(
-                        data.id
-                    );
-
-                if (!item) {
-                    return;
-                }
-
-                item.statusCode =
-                    Number(
-                        data.statusCode ||
-                            200
-                    );
-
-                item.headers =
-                    data.headers || {};
-
-                let body =
-                    Buffer.alloc(0);
-
-                try {
                     if (
-                        data.body
+                        data.type !==
+                        "response_chunk"
                     ) {
-                        body =
-                            Buffer.from(
-                                data.body,
-                                "base64"
+                        console.log(
+                            "[ESP32 -> RENDER]",
+                            data.type
+                        );
+                    }
+
+                    // =================================================
+                    // ESP32 REGISTRATION
+                    // =================================================
+
+                    if (
+                        data.type ===
+                        "esp32"
+                    ) {
+                        if (
+                            esp32 &&
+                            esp32 !== ws
+                        ) {
+                            try {
+                                esp32.close();
+                            } catch {}
+                        }
+
+                        esp32 = ws;
+
+                        console.log(
+                            "[WS] ESP32 registered"
+                        );
+
+                        ws.send(
+                            JSON.stringify({
+                                type:
+                                    "registered"
+                            })
+                        );
+
+                        return;
+                    }
+
+                    // =================================================
+                    // APPLICATION HEARTBEAT
+                    // =================================================
+
+                    if (
+                        data.type ===
+                        "heartbeat"
+                    ) {
+                        ws.isAlive =
+                            true;
+
+                        ws.lastHeartbeat =
+                            Date.now();
+
+                        try {
+                            ws.send(
+                                JSON.stringify(
+                                    {
+                                        type:
+                                            "heartbeat_ack"
+                                    }
+                                )
+                            );
+                        } catch (err) {
+                            console.error(
+                                "[WS] Heartbeat ACK failed:",
+                                err.message
+                            );
+                        }
+
+                        return;
+                    }
+
+                    // =================================================
+                    // LEGACY RESPONSE
+                    // =================================================
+
+                    if (
+                        data.type ===
+                        "response"
+                    ) {
+                        const item =
+                            pending.get(
+                                data.id
+                            );
+
+                        if (!item) {
+                            return;
+                        }
+
+                        let body;
+
+                        try {
+                            body =
+                                Buffer.from(
+                                    data.body ||
+                                        "",
+                                    "base64"
+                                );
+                        } catch {
+                            failPending(
+                                data.id,
+                                502,
+                                "Invalid response body from ESP32"
+                            );
+
+                            return;
+                        }
+
+                        item.statusCode =
+                            Number(
+                                data.statusCode ||
+                                    200
+                            );
+
+                        item.headers =
+                            data.headers ||
+                            {};
+
+                        sendPendingResponse(
+                            data.id,
+                            item,
+                            body
+                        );
+
+                        return;
+                    }
+
+                    // =================================================
+                    // CHUNKED RESPONSE START
+                    // =================================================
+
+                    if (
+                        data.type ===
+                        "response_start"
+                    ) {
+                        const item =
+                            pending.get(
+                                data.id
+                            );
+
+                        if (!item) {
+                            return;
+                        }
+
+                        item.statusCode =
+                            Number(
+                                data.statusCode ||
+                                    200
+                            );
+
+                        item.headers =
+                            data.headers ||
+                            {};
+
+                        item.expectedLength =
+                            Number.isFinite(
+                                Number(
+                                    data.expectedLength
+                                )
+                            )
+                                ? Number(
+                                      data.expectedLength
+                                  )
+                                : -1;
+
+                        item.chunks = [];
+
+                        item.receivedBytes =
+                            0;
+
+                        item.finished =
+                            false;
+
+                        console.log(
+                            "[TUNNEL] Response start",
+                            item.statusCode,
+                            "expected:",
+                            item.expectedLength,
+                            "id:",
+                            data.id
+                        );
+
+                        return;
+                    }
+
+                    // =================================================
+                    // CHUNKED RESPONSE DATA
+                    // =================================================
+
+                    if (
+                        data.type ===
+                        "response_chunk"
+                    ) {
+                        const item =
+                            pending.get(
+                                data.id
+                            );
+
+                        if (
+                            !item ||
+                            item.finished
+                        ) {
+                            return;
+                        }
+
+                        let chunk;
+
+                        try {
+                            chunk =
+                                Buffer.from(
+                                    data.body ||
+                                        "",
+                                    "base64"
+                                );
+                        } catch {
+                            failPending(
+                                data.id,
+                                502,
+                                "Invalid response chunk from ESP32"
+                            );
+
+                            return;
+                        }
+
+                        if (
+                            chunk.length >
+                            0
+                        ) {
+                            item.chunks.push(
+                                chunk
+                            );
+
+                            item.receivedBytes +=
+                                chunk.length;
+                        }
+
+                        return;
+                    }
+
+                    // =================================================
+                    // CHUNKED RESPONSE END
+                    // =================================================
+
+                    if (
+                        data.type ===
+                        "response_end"
+                    ) {
+                        const item =
+                            pending.get(
+                                data.id
+                            );
+
+                        if (
+                            !item ||
+                            item.finished
+                        ) {
+                            return;
+                        }
+
+                        const body =
+                            Buffer.concat(
+                                item.chunks ||
+                                    []
+                            );
+
+                        console.log(
+                            "[TUNNEL] Response end",
+                            "received:",
+                            body.length,
+                            "reported:",
+                            Number(
+                                data.totalBytes ||
+                                    0
+                            ),
+                            "expected:",
+                            item.expectedLength,
+                            "id:",
+                            data.id
+                        );
+
+                        sendPendingResponse(
+                            data.id,
+                            item,
+                            body
+                        );
+
+                        return;
+                    }
+
+                } catch (error) {
+                    console.error(
+                        "[WS] Message processing error:",
+                        error.message
+                    );
+                }
+            }
+        );
+
+        // =========================================================
+        // PONG
+        // =========================================================
+
+        ws.on(
+            "pong",
+            () => {
+                ws.isAlive = true;
+            }
+        );
+
+        // =========================================================
+        // CLOSE
+        // =========================================================
+
+        ws.on(
+            "close",
+            () => {
+                console.log(
+                    "[WS] ESP32 socket closed"
+                );
+
+                if (
+                    esp32 === ws
+                ) {
+                    esp32 = null;
+                }
+
+                for (
+                    const [
+                        id,
+                        item
+                    ]
+                    of pending.entries()
+                ) {
+                    clearTimeout(
+                        item.timer
+                    );
+
+                    if (
+                        !item.res.headersSent
+                    ) {
+                        item.res
+                            .status(503)
+                            .send(
+                                "ESP32 disconnected"
                             );
                     }
-                } catch {
-                    failPending(
-                        data.id,
-                        502,
-                        "Invalid upload response from ESP32"
-                    );
 
-                    return;
+                    pending.delete(
+                        id
+                    );
                 }
-
-                sendPendingResponse(
-                    data.id,
-                    item,
-                    body
-                );
-
-                return;
             }
-
-            // =================================================
-            // UPLOAD ERROR
-            // =================================================
-
-            if (
-                data.type ===
-                "upload_error"
-            ) {
-                failPending(
-                    data.id,
-                    Number(
-                        data.statusCode ||
-                            502
-                    ),
-                    data.message ||
-                        "ESP32 upload failed"
-                );
-
-                return;
-            }
-
-        } catch (error) {
-            console.error(
-                "[WS] Message processing error:",
-                error.message
-            );
-        }
-    });
-
-    // =========================================================
-    // CONNECTION CLOSED
-    // =========================================================
-
-    ws.on("close", () => {
-        console.log(
-            "[WS] ESP32 socket closed"
         );
 
-        if (esp32 === ws) {
-            esp32 = null;
-        }
+        // =========================================================
+        // ERROR
+        // =========================================================
 
-        for (
-            const [id, item]
-            of pending.entries()
-        ) {
-            clearTimeout(
-                item.timer
-            );
-
-            if (!item.res.headersSent) {
-                item.res
-                    .status(503)
-                    .send(
-                        "ESP32 disconnected"
-                    );
+        ws.on(
+            "error",
+            (error) => {
+                console.error(
+                    "[WS] ESP32 socket error:",
+                    error.message
+                );
             }
-
-            pending.delete(id);
-        }
-    });
-
-    // =========================================================
-    // WEBSOCKET ERROR
-    // =========================================================
-
-    ws.on("error", (error) => {
-        console.error(
-            "[WS] ESP32 socket error:",
-            error.message
         );
-    });
-});
+    }
+);
 
 // ============================================================
-// CLOUD STATUS
+// WEBSOCKET KEEPALIVE
+// ============================================================
+
+const heartbeatTimer =
+    setInterval(
+        () => {
+            wss.clients.forEach(
+                (ws) => {
+                    if (
+                        ws.readyState !==
+                        WebSocket.OPEN
+                    ) {
+                        return;
+                    }
+
+                    if (
+                        ws.isAlive ===
+                        false
+                    ) {
+                        console.log(
+                            "[WS] Terminating stale ESP32 connection"
+                        );
+
+                        try {
+                            ws.terminate();
+                        } catch {}
+
+                        return;
+                    }
+
+                    ws.isAlive =
+                        false;
+
+                    try {
+                        ws.ping();
+                    } catch (err) {
+                        console.error(
+                            "[WS] Ping failed:",
+                            err.message
+                        );
+                    }
+                }
+            );
+        },
+        HEARTBEAT_INTERVAL
+    );
+
+wss.on(
+    "close",
+    () => {
+        clearInterval(
+            heartbeatTimer
+        );
+    }
+);
+
+// ============================================================
+// STATUS
 // ============================================================
 
 app.get(
@@ -920,7 +1011,7 @@ app.get(
 );
 
 // ============================================================
-// RAW BODY PARSER
+// RAW BODY
 // ============================================================
 
 app.use(
@@ -931,7 +1022,11 @@ app.use(
 );
 
 // ============================================================
-// CLOUD FILE UPLOAD
+// CLOUD UPLOAD
+// ============================================================
+//
+// This route MUST come before the normal catch-all proxy.
+//
 // ============================================================
 
 app.post(
@@ -940,198 +1035,235 @@ app.post(
         handleCloudUpload(
             req,
             res
-        ).catch((error) => {
-            console.error(
-                "[CLOUD UPLOAD] Unexpected error:",
-                error
-            );
+        ).catch(
+            (error) => {
+                console.error(
+                    "[CLOUD UPLOAD] Unexpected error:",
+                    error
+                );
 
-            if (!res.headersSent) {
-                res
-                    .status(500)
-                    .send(
-                        "Upload failed"
-                    );
+                if (
+                    !res.headersSent
+                ) {
+                    res
+                        .status(500)
+                        .send(
+                            "Upload failed"
+                        );
+                }
             }
-        });
+        );
     }
 );
 
 // ============================================================
-// NORMAL HTTP -> ESP32
+// NORMAL HTTP -> ESP32 PROXY
 // ============================================================
 
-app.use((req, res) => {
-    console.log(
-        "[HTTP -> ESP32]",
-        req.method,
-        req.originalUrl
-    );
-
-    if (
-        !esp32 ||
-        esp32.readyState !==
-            WebSocket.OPEN
-    ) {
-        return res
-            .status(503)
-            .send(
-                "ESP32 is not connected"
-            );
-    }
-
-    const id =
-        `${Date.now()}-${Math.random()
-            .toString(36)
-            .slice(2, 10)}`;
-
-    // --------------------------------------------------------
-    // Forward browser headers
-    // --------------------------------------------------------
-
-    const headers = {};
-
-    for (
-        const [key, value]
-        of Object.entries(
-            req.headers
-        )
-    ) {
-        const lower =
-            key.toLowerCase();
+app.use(
+    (req, res) => {
+        console.log(
+            "[HTTP -> ESP32]",
+            req.method,
+            req.originalUrl
+        );
 
         if (
-            lower === "cookie" ||
-            lower === "content-type" ||
-            lower === "content-length" ||
-            lower === "x-api-key" ||
-            lower === "authorization" ||
-            lower === "user-agent" ||
-            lower === "accept" ||
-            lower === "accept-language" ||
-            lower === "referer" ||
-            lower === "origin"
+            !esp32 ||
+            esp32.readyState !==
+                WebSocket.OPEN
         ) {
-            headers[lower] =
-                Array.isArray(value)
-                    ? value.join(", ")
-                    : String(value);
-        }
-    }
-
-    // --------------------------------------------------------
-    // Body -> Base64
-    // --------------------------------------------------------
-
-    let body = "";
-
-    if (
-        req.body &&
-        Buffer.isBuffer(req.body) &&
-        req.body.length > 0
-    ) {
-        body =
-            req.body.toString(
-                "base64"
-            );
-    }
-
-    // --------------------------------------------------------
-    // Timeout
-    // --------------------------------------------------------
-
-    const timer =
-        setTimeout(() => {
-            const item =
-                pending.get(id);
-
-            if (!item) {
-                return;
-            }
-
-            pending.delete(id);
-
-            if (!res.headersSent) {
-                res
-                    .status(504)
-                    .send(
-                        "ESP32 request timeout"
-                    );
-            }
-        }, 30000);
-
-    // --------------------------------------------------------
-    // Pending request
-    // --------------------------------------------------------
-
-    pending.set(id, {
-        res,
-        timer,
-        finished: false,
-        chunks: [],
-        receivedBytes: 0,
-        statusCode: 200,
-        headers: {}
-    });
-
-    // --------------------------------------------------------
-    // Message to ESP32
-    // --------------------------------------------------------
-
-    const message = {
-        type: "request",
-        id,
-        method: req.method,
-        path: req.originalUrl,
-        headers,
-        body
-    };
-
-    // --------------------------------------------------------
-    // Send
-    // --------------------------------------------------------
-
-    try {
-        esp32.send(
-            JSON.stringify(
-                message
-            )
-        );
-
-        console.log(
-            "[WS] Request sent:",
-            req.method,
-            req.originalUrl,
-            "id:",
-            id
-        );
-
-    } catch (error) {
-        clearTimeout(timer);
-
-        pending.delete(id);
-
-        console.error(
-            "[WS] Failed to send request:",
-            error.message
-        );
-
-        if (!res.headersSent) {
-            res
-                .status(502)
+            return res
+                .status(503)
                 .send(
-                    "Failed to send request to ESP32"
+                    "ESP32 is not connected"
                 );
         }
+
+        // --------------------------------------------------------
+        // Request ID
+        // --------------------------------------------------------
+
+        const id =
+            `${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 10)}`;
+
+        // --------------------------------------------------------
+        // Forward important headers
+        // --------------------------------------------------------
+
+        const headers = {};
+
+        for (
+            const [key, value]
+            of Object.entries(
+                req.headers
+            )
+        ) {
+            const lower =
+                key.toLowerCase();
+
+            if (
+                lower === "cookie" ||
+                lower === "content-type" ||
+                lower === "content-length" ||
+                lower === "x-api-key" ||
+                lower === "authorization" ||
+                lower === "user-agent" ||
+                lower === "accept" ||
+                lower === "accept-language" ||
+                lower === "referer" ||
+                lower === "origin"
+            ) {
+                headers[lower] =
+                    Array.isArray(
+                        value
+                    )
+                        ? value.join(
+                              ", "
+                          )
+                        : String(value);
+            }
+        }
+
+        // --------------------------------------------------------
+        // Body -> Base64
+        // --------------------------------------------------------
+
+        let body = "";
+
+        if (
+            req.body &&
+            Buffer.isBuffer(
+                req.body
+            ) &&
+            req.body.length > 0
+        ) {
+            body =
+                req.body.toString(
+                    "base64"
+                );
+        }
+
+        // --------------------------------------------------------
+        // Timeout
+        // --------------------------------------------------------
+
+        const timer =
+            setTimeout(
+                () => {
+                    const item =
+                        pending.get(
+                            id
+                        );
+
+                    if (!item) {
+                        return;
+                    }
+
+                    pending.delete(
+                        id
+                    );
+
+                    if (
+                        !res.headersSent
+                    ) {
+                        res
+                            .status(504)
+                            .send(
+                                "ESP32 request timeout"
+                            );
+                    }
+                },
+                30000
+            );
+
+        // --------------------------------------------------------
+        // Save pending request
+        // --------------------------------------------------------
+
+        pending.set(
+            id,
+            {
+                res,
+                timer,
+                finished: false,
+                chunks: [],
+                receivedBytes: 0,
+                statusCode: 200,
+                headers: {}
+            }
+        );
+
+        // --------------------------------------------------------
+        // Message to ESP32
+        // --------------------------------------------------------
+
+        const message = {
+            type: "request",
+            id,
+            method:
+                req.method,
+            path:
+                req.originalUrl,
+            headers,
+            body
+        };
+
+        // --------------------------------------------------------
+        // Send WebSocket message
+        // --------------------------------------------------------
+
+        try {
+            esp32.send(
+                JSON.stringify(
+                    message
+                )
+            );
+
+            console.log(
+                "[WS] Request sent:",
+                req.method,
+                req.originalUrl,
+                "id:",
+                id
+            );
+
+        } catch (error) {
+            clearTimeout(
+                timer
+            );
+
+            pending.delete(
+                id
+            );
+
+            console.error(
+                "[WS] Failed to send request:",
+                error.message
+            );
+
+            if (
+                !res.headersSent
+            ) {
+                res
+                    .status(502)
+                    .send(
+                        "Failed to send request to ESP32"
+                    );
+            }
+        }
     }
-});
+);
 
 // ============================================================
 // SERVER
 // ============================================================
 
 const PORT =
-    process.env.PORT || 3000;
+    process.env.PORT ||
+    3000;
 
 server.listen(
     PORT,
@@ -1159,7 +1291,7 @@ server.listen(
 );
 
 // ============================================================
-// ERROR HANDLING
+// PROCESS ERROR HANDLING
 // ============================================================
 
 process.on(
