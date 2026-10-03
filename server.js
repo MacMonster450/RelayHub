@@ -6,7 +6,7 @@ const app = express();
 const server = http.createServer(app);
 
 // ============================================================
-// ESP32 WEBSOCKET SERVER
+// WEBSOCKET SERVER FOR ESP32
 // ============================================================
 
 const wss = new WebSocket.Server({
@@ -16,11 +16,11 @@ const wss = new WebSocket.Server({
 
 let esp32 = null;
 
-// Browser requests waiting for ESP32 responses
+// Browser requests waiting for ESP32 response
 const pending = new Map();
 
 // ============================================================
-// ESP32 CONNECTION
+// WEBSOCKET CONNECTION
 // ============================================================
 
 wss.on("connection", (ws) => {
@@ -32,17 +32,19 @@ wss.on("connection", (ws) => {
 
             console.log("[ESP32 -> RENDER]", data.type);
 
-            // ------------------------------------------------
-            // ESP32 REGISTER
-            // ------------------------------------------------
+            // =================================================
+            // ESP32 REGISTRATION
+            // =================================================
 
             if (data.type === "esp32") {
+
+                // Close previous ESP32 connection
                 if (esp32 && esp32 !== ws) {
                     try {
                         esp32.close();
                     } catch (err) {
                         console.error(
-                            "[WS] Error closing old ESP32:",
+                            "[WS] Failed to close old connection:",
                             err.message
                         );
                     }
@@ -52,27 +54,21 @@ wss.on("connection", (ws) => {
 
                 console.log("[WS] ESP32 registered");
 
-                try {
-                    ws.send(
-                        JSON.stringify({
-                            type: "registered"
-                        })
-                    );
-                } catch (err) {
-                    console.error(
-                        "[WS] Registration response failed:",
-                        err.message
-                    );
-                }
+                ws.send(
+                    JSON.stringify({
+                        type: "registered"
+                    })
+                );
 
                 return;
             }
 
-            // ------------------------------------------------
+            // =================================================
             // RESPONSE FROM ESP32
-            // ------------------------------------------------
+            // =================================================
 
             if (data.type === "response") {
+
                 const item = pending.get(data.id);
 
                 if (!item) {
@@ -86,7 +82,10 @@ wss.on("connection", (ws) => {
                 clearTimeout(item.timer);
                 pending.delete(data.id);
 
-                // Decode body from Base64
+                // ------------------------------------------------
+                // DECODE BASE64 BODY
+                // ------------------------------------------------
+
                 let body;
 
                 try {
@@ -95,15 +94,18 @@ wss.on("connection", (ws) => {
                         "base64"
                     );
                 } catch (err) {
+
                     console.error(
-                        "[HTTP] Invalid Base64 body:",
+                        "[HTTP] Base64 decode error:",
                         err.message
                     );
 
                     if (!item.res.headersSent) {
                         item.res
                             .status(502)
-                            .send("Invalid response body from ESP32");
+                            .send(
+                                "Invalid response body from ESP32"
+                            );
                     }
 
                     return;
@@ -112,13 +114,17 @@ wss.on("connection", (ws) => {
                 const headers = data.headers || {};
 
                 // ------------------------------------------------
-                // FORWARD ESP32 RESPONSE HEADERS
+                // FORWARD RESPONSE HEADERS
                 // ------------------------------------------------
 
-                for (const [key, value] of Object.entries(headers)) {
+                for (
+                    const [key, value]
+                    of Object.entries(headers)
+                ) {
+
                     const lower = key.toLowerCase();
 
-                    // Render must manage these itself
+                    // Render controls these headers
                     if (
                         lower === "connection" ||
                         lower === "content-length" ||
@@ -134,14 +140,21 @@ wss.on("connection", (ws) => {
                         continue;
                     }
 
-                    // Important for login session cookie
+                    // ------------------------------------------------
+                    // COOKIE
+                    // ------------------------------------------------
+
                     if (lower === "set-cookie") {
+
                         if (Array.isArray(value)) {
+
                             item.res.setHeader(
                                 "Set-Cookie",
                                 value.map(String)
                             );
+
                         } else {
+
                             item.res.setHeader(
                                 "Set-Cookie",
                                 [String(value)]
@@ -151,13 +164,19 @@ wss.on("connection", (ws) => {
                         continue;
                     }
 
-                    // Handle array-valued headers
+                    // ------------------------------------------------
+                    // NORMAL HEADERS
+                    // ------------------------------------------------
+
                     if (Array.isArray(value)) {
+
                         item.res.setHeader(
                             key,
                             value.map(String)
                         );
+
                     } else {
+
                         item.res.setHeader(
                             key,
                             String(value)
@@ -166,7 +185,8 @@ wss.on("connection", (ws) => {
                 }
 
                 // ------------------------------------------------
-                // CONTENT LENGTH
+                // IMPORTANT:
+                // SET EXACT BODY LENGTH
                 // ------------------------------------------------
 
                 item.res.setHeader(
@@ -178,10 +198,15 @@ wss.on("connection", (ws) => {
                 // CACHE CONTROL
                 // ------------------------------------------------
 
-                if (!item.res.getHeader("Cache-Control")) {
+                if (
+                    !item.res.getHeader(
+                        "Cache-Control"
+                    )
+                ) {
                     item.res.setHeader(
                         "Cache-Control",
-                        headers["cache-control"] || "no-store"
+                        headers["cache-control"] ||
+                        "no-store"
                     );
                 }
 
@@ -196,7 +221,9 @@ wss.on("connection", (ws) => {
                     "[HTTP] -> Browser",
                     statusCode,
                     "bytes:",
-                    body.length
+                    body.length,
+                    "request:",
+                    data.id
                 );
 
                 if (!item.res.headersSent) {
@@ -209,43 +236,55 @@ wss.on("connection", (ws) => {
             }
 
         } catch (error) {
+
             console.error(
-                "[WS] Message error:",
+                "[WS] Message processing error:",
                 error.message
             );
         }
     });
 
-    // ========================================================
-    // ESP32 DISCONNECTED
-    // ========================================================
+    // =========================================================
+    // ESP32 CLOSED
+    // =========================================================
 
     ws.on("close", () => {
-        console.log("[WS] ESP32 socket closed");
+
+        console.log(
+            "[WS] ESP32 socket closed"
+        );
 
         if (esp32 === ws) {
             esp32 = null;
         }
 
         // Fail all waiting browser requests
-        for (const [id, item] of pending.entries()) {
+        for (
+            const [id, item]
+            of pending.entries()
+        ) {
+
             clearTimeout(item.timer);
 
             if (!item.res.headersSent) {
+
                 item.res
                     .status(503)
-                    .send("ESP32 disconnected");
+                    .send(
+                        "ESP32 disconnected"
+                    );
             }
 
             pending.delete(id);
         }
     });
 
-    // ========================================================
-    // WEBSOCKET ERROR
-    // ========================================================
+    // =========================================================
+    // ESP32 ERROR
+    // =========================================================
 
     ws.on("error", (error) => {
+
         console.error(
             "[WS] ESP32 socket error:",
             error.message
@@ -258,22 +297,28 @@ wss.on("connection", (ws) => {
 // ============================================================
 
 app.get("/cloud-status", (req, res) => {
+
     res.json({
         render: true,
+
         esp32Connected:
             !!esp32 &&
             esp32.readyState === WebSocket.OPEN,
-        pendingRequests: pending.size
+
+        pendingRequests:
+            pending.size
     });
 });
 
 // ============================================================
-// HEALTH
+// HEALTH CHECK
 // ============================================================
 
 app.get("/health", (req, res) => {
+
     res.json({
         ok: true,
+
         esp32Connected:
             !!esp32 &&
             esp32.readyState === WebSocket.OPEN
@@ -281,15 +326,16 @@ app.get("/health", (req, res) => {
 });
 
 // ============================================================
-// RAW BODY PARSER
+// RAW REQUEST BODY
 // ============================================================
 //
-// Required for:
+// Supports:
+//
 // POST /login
 // POST /upload
+// POST /api/files
 // POST /api/data
 // POST /api/ota
-// etc.
 //
 // ============================================================
 
@@ -301,51 +347,57 @@ app.use(
 );
 
 // ============================================================
-// HTTP -> ESP32
+// HTTP REQUEST -> ESP32
 // ============================================================
 
 app.use((req, res) => {
+
     console.log(
         "[HTTP -> ESP32]",
         req.method,
         req.originalUrl
     );
 
-    // --------------------------------------------------------
-    // CHECK ESP32
-    // --------------------------------------------------------
+    // =========================================================
+    // CHECK ESP32 CONNECTION
+    // =========================================================
 
     if (
         !esp32 ||
         esp32.readyState !== WebSocket.OPEN
     ) {
+
         console.log(
-            "[HTTP] ESP32 is not connected"
+            "[HTTP] ESP32 not connected"
         );
 
         return res
             .status(503)
-            .send("ESP32 is not connected");
+            .send(
+                "ESP32 is not connected"
+            );
     }
 
-    // --------------------------------------------------------
-    // UNIQUE REQUEST ID
-    // --------------------------------------------------------
+    // =========================================================
+    // CREATE REQUEST ID
+    // =========================================================
 
     const id =
         `${Date.now()}-${Math.random()
             .toString(36)
             .slice(2, 10)}`;
 
-    // --------------------------------------------------------
-    // FORWARD IMPORTANT REQUEST HEADERS
-    // --------------------------------------------------------
+    // =========================================================
+    // COPY IMPORTANT BROWSER HEADERS
+    // =========================================================
 
     const headers = {};
 
-    for (const [key, value] of Object.entries(
-        req.headers
-    )) {
+    for (
+        const [key, value]
+        of Object.entries(req.headers)
+    ) {
+
         const lower = key.toLowerCase();
 
         if (
@@ -360,17 +412,23 @@ app.use((req, res) => {
             lower === "referer" ||
             lower === "origin"
         ) {
+
             if (Array.isArray(value)) {
-                headers[lower] = value.join(", ");
+
+                headers[lower] =
+                    value.join(", ");
+
             } else {
-                headers[lower] = String(value);
+
+                headers[lower] =
+                    String(value);
             }
         }
     }
 
-    // --------------------------------------------------------
-    // BODY -> BASE64
-    // --------------------------------------------------------
+    // =========================================================
+    // REQUEST BODY -> BASE64
+    // =========================================================
 
     let body = "";
 
@@ -379,15 +437,19 @@ app.use((req, res) => {
         Buffer.isBuffer(req.body) &&
         req.body.length > 0
     ) {
-        body = req.body.toString("base64");
+
+        body =
+            req.body.toString("base64");
     }
 
-    // --------------------------------------------------------
-    // REQUEST TIMEOUT
-    // --------------------------------------------------------
+    // =========================================================
+    // 30 SECOND REQUEST TIMEOUT
+    // =========================================================
 
     const timer = setTimeout(() => {
-        const item = pending.get(id);
+
+        const item =
+            pending.get(id);
 
         if (!item) {
             return;
@@ -396,49 +458,63 @@ app.use((req, res) => {
         pending.delete(id);
 
         console.log(
-            "[HTTP] Timeout:",
+            "[HTTP] Request timeout:",
             req.method,
-            req.originalUrl
+            req.originalUrl,
+            "id:",
+            id
         );
 
         if (!res.headersSent) {
+
             res
                 .status(504)
-                .send("ESP32 request timeout");
+                .send(
+                    "ESP32 request timeout"
+                );
         }
+
     }, 30000);
 
-    // --------------------------------------------------------
-    // STORE REQUEST
-    // --------------------------------------------------------
+    // =========================================================
+    // SAVE PENDING REQUEST
+    // =========================================================
 
     pending.set(id, {
         res,
         timer
     });
 
-    // --------------------------------------------------------
-    // REQUEST MESSAGE FOR ESP32
-    // --------------------------------------------------------
+    // =========================================================
+    // MESSAGE FOR ESP32
+    // =========================================================
 
     const message = {
+
         type: "request",
+
         id,
-        method: req.method,
-        path: req.originalUrl,
+
+        method:
+            req.method,
+
+        path:
+            req.originalUrl,
+
         headers,
+
         body
     };
 
-    // --------------------------------------------------------
-    // SEND TO ESP32
-    // --------------------------------------------------------
+    // =========================================================
+    // SEND REQUEST THROUGH WEBSOCKET
+    // =========================================================
 
     try {
-        const jsonMessage =
-            JSON.stringify(message);
 
-        esp32.send(jsonMessage);
+        esp32.send(
+            JSON.stringify(message)
+        );
 
         console.log(
             "[WS] Request sent:",
@@ -449,6 +525,7 @@ app.use((req, res) => {
         );
 
     } catch (error) {
+
         clearTimeout(timer);
         pending.delete(id);
 
@@ -458,6 +535,7 @@ app.use((req, res) => {
         );
 
         if (!res.headersSent) {
+
             res
                 .status(502)
                 .send(
@@ -468,7 +546,7 @@ app.use((req, res) => {
 });
 
 // ============================================================
-// PORT
+// RENDER PORT
 // ============================================================
 
 const PORT =
@@ -479,12 +557,21 @@ const PORT =
 // ============================================================
 
 server.listen(PORT, () => {
+
+    console.log(
+        "========================================"
+    );
+
     console.log(
         `Render gateway listening on port ${PORT}`
     );
 
     console.log(
-        `WebSocket endpoint: /tunnel`
+        "WebSocket endpoint: /tunnel"
+    );
+
+    console.log(
+        "========================================"
     );
 });
 
@@ -492,16 +579,24 @@ server.listen(PORT, () => {
 // PROCESS ERROR HANDLING
 // ============================================================
 
-process.on("uncaughtException", (error) => {
-    console.error(
-        "[PROCESS] Uncaught exception:",
-        error
-    );
-});
+process.on(
+    "uncaughtException",
+    (error) => {
 
-process.on("unhandledRejection", (error) => {
-    console.error(
-        "[PROCESS] Unhandled rejection:",
-        error
-    );
-});
+        console.error(
+            "[PROCESS] Uncaught exception:",
+            error
+        );
+    }
+);
+
+process.on(
+    "unhandledRejection",
+    (error) => {
+
+        console.error(
+            "[PROCESS] Unhandled rejection:",
+            error
+        );
+    }
+);
