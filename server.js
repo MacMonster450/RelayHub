@@ -3,158 +3,255 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const app = express();
+
 const server = http.createServer(app);
 
 const wss = new WebSocket.Server({
-  server,
-  path: "/tunnel"
+    server,
+    path: "/tunnel"
 });
 
 let esp32 = null;
 
+let pendingRequest = null;
+
+
 // ========================================
-// ESP32 WEBSOCKET CONNECTION
+// ESP32 WEBSOCKET
 // ========================================
 
 wss.on("connection", (ws) => {
-  console.log("WebSocket client connected");
 
-  ws.on("message", (message) => {
-    try {
-      const data = JSON.parse(message.toString());
+    console.log("WebSocket client connected");
 
-      console.log("ESP32 -> Render:", data);
 
-      // ESP32 identifies itself
-      if (data.type === "esp32") {
-        esp32 = ws;
+    ws.on("message", (message) => {
 
-        console.log("ESP32 registered");
+        try {
 
-        ws.send(JSON.stringify({
-          type: "registered",
-          message: "ESP32 connected successfully"
-        }));
+            const data =
+                JSON.parse(message.toString());
 
-        return;
-      }
 
-      // Response from ESP32
-      if (data.type === "response") {
-        console.log("Response received from ESP32");
+            console.log(
+                "ESP32 -> Render:",
+                data.type
+            );
 
-        return;
-      }
 
-      // Pong from ESP32
-      if (data.type === "pong") {
-        console.log("Pong received from ESP32");
-        return;
-      }
+            // -----------------------------
+            // ESP32 REGISTER
+            // -----------------------------
 
-    } catch (error) {
-      console.log("Invalid message:", message.toString());
-    }
-  });
+            if (data.type === "esp32") {
 
-  ws.on("close", () => {
-    console.log("WebSocket disconnected");
+                esp32 = ws;
 
-    if (esp32 === ws) {
-      esp32 = null;
-      console.log("ESP32 disconnected");
-    }
-  });
+                console.log(
+                    "ESP32 registered"
+                );
+
+                ws.send(
+                    JSON.stringify({
+                        type: "registered"
+                    })
+                );
+
+                return;
+            }
+
+
+            // -----------------------------
+            // HTTP RESPONSE
+            // -----------------------------
+
+            if (
+                data.type === "http_response"
+            ) {
+
+                console.log(
+                    "HTTP response received from ESP32"
+                );
+
+
+                if (
+                    pendingRequest
+                ) {
+
+                    const request =
+                        pendingRequest;
+
+                    pendingRequest = null;
+
+
+                    resSend(
+                        request.res,
+                        data
+                    );
+                }
+
+                return;
+            }
+
+
+            // -----------------------------
+            // PONG
+            // -----------------------------
+
+            if (data.type === "pong") {
+
+                console.log(
+                    "Pong received"
+                );
+
+                return;
+            }
+
+        }
+        catch (error) {
+
+            console.log(
+                "Invalid WebSocket message"
+            );
+
+            console.log(
+                error.message
+            );
+        }
+
+    });
+
+
+    ws.on("close", () => {
+
+        console.log(
+            "WebSocket disconnected"
+        );
+
+
+        if (esp32 === ws) {
+
+            esp32 = null;
+
+            console.log(
+                "ESP32 disconnected"
+            );
+        }
+
+    });
+
 });
 
 
 // ========================================
-// RENDER TEST PAGE
+// SEND RESPONSE TO BROWSER
+// ========================================
+
+function resSend(res, data) {
+
+    const status =
+        data.status || 200;
+
+
+    const contentType =
+        data.contentType ||
+        "text/plain";
+
+
+    res.status(status);
+
+    res.set(
+        "Content-Type",
+        contentType
+    );
+
+
+    res.send(
+        data.body || ""
+    );
+}
+
+
+// ========================================
+// HOME PAGE
 // ========================================
 
 app.get("/", (req, res) => {
 
-  res.send(`
+    res.send(`
 <!DOCTYPE html>
+
 <html>
+
 <head>
-    <title>ESP32 Cloud Relay</title>
 
-    <style>
-        body {
-            font-family: Arial;
-            background: #111;
-            color: white;
-            text-align: center;
-            padding: 50px;
-        }
+<title>ESP32 Cloud Tunnel</title>
 
-        .box {
-            max-width: 600px;
-            margin: auto;
-            background: #222;
-            padding: 30px;
-            border-radius: 15px;
-        }
+<style>
 
-        button {
-            padding: 12px 25px;
-            font-size: 16px;
-            cursor: pointer;
-        }
+body {
+    background:#111;
+    color:white;
+    font-family:Arial;
+    text-align:center;
+    padding:50px;
+}
 
-        #result {
-            margin-top: 20px;
-            padding: 15px;
-            background: #000;
-            border-radius: 10px;
-        }
-    </style>
+button {
+    padding:15px 30px;
+    font-size:18px;
+    cursor:pointer;
+}
+
+#result {
+    margin-top:30px;
+}
+
+</style>
+
 </head>
 
 <body>
 
-<div class="box">
+<h1>ESP32 Cloud Tunnel</h1>
 
-    <h1>ESP32 Cloud Relay</h1>
+<p>
+Render → ESP32 HTTP Test
+</p>
 
-    <p>
-        Render Gateway Test
-    </p>
+<button onclick="test()">
+Test ESP32 HTTP
+</button>
 
-    <button onclick="testESP32()">
-        Test ESP32
-    </button>
-
-    <div id="result">
-        Waiting...
-    </div>
-
+<div id="result">
+Waiting...
 </div>
 
 <script>
 
-async function testESP32() {
+async function test() {
 
     const result =
         document.getElementById("result");
 
-    result.innerText = "Testing...";
+    result.innerHTML =
+        "Requesting ESP32...";
 
     try {
 
         const response =
-            await fetch("/test");
+            await fetch("/esp32-test");
 
-        const text =
+        const html =
             await response.text();
 
-        result.innerText = text;
+        result.innerHTML = html;
 
-    } catch (error) {
+    }
+    catch(error) {
 
-        result.innerText =
-            "Error: " + error;
+        result.innerHTML =
+            "ERROR: " + error;
 
     }
 
@@ -163,49 +260,94 @@ async function testESP32() {
 </script>
 
 </body>
+
 </html>
-  `);
+`);
 
 });
 
 
 // ========================================
-// TEST ESP32 CONNECTION
+// ESP32 HTTP TEST
 // ========================================
 
-app.get("/test", (req, res) => {
+app.get("/esp32-test", (req, res) => {
 
-  if (!esp32) {
-
-    return res.status(503).send(
-      "ESP32 is not connected to Render"
+    console.log(
+        "Browser requested ESP32"
     );
 
-  }
 
-  const requestId =
-    Date.now().toString();
+    // Check ESP32
+    if (!esp32) {
 
-  const message = {
+        return res.status(503).send(
+            "ESP32 is not connected"
+        );
 
-    type: "test",
+    }
 
-    id: requestId
 
-  };
+    // Prevent multiple requests
+    if (pendingRequest) {
 
-  console.log(
-    "Render -> ESP32:",
-    message
-  );
+        return res.status(429).send(
+            "Another request is already running"
+        );
 
-  esp32.send(
-    JSON.stringify(message)
-  );
+    }
 
-  res.send(
-    "Request sent to ESP32. Check ESP32 Serial Monitor."
-  );
+
+    pendingRequest = {
+        res: res
+    };
+
+
+    // Send request to ESP32
+
+    const message = {
+
+        type: "http_test"
+
+    };
+
+
+    console.log(
+        "Render -> ESP32:",
+        message
+    );
+
+
+    esp32.send(
+        JSON.stringify(message)
+    );
+
+
+    // Timeout
+
+    setTimeout(() => {
+
+        if (pendingRequest) {
+
+            pendingRequest = null;
+
+            try {
+
+                res.status(504).send(
+                    "ESP32 response timeout"
+                );
+
+            }
+            catch (error) {
+
+                console.log(
+                    "Response already closed"
+                );
+            }
+
+        }
+
+    }, 15000);
 
 });
 
@@ -216,29 +358,33 @@ app.get("/test", (req, res) => {
 
 app.get("/api/status", (req, res) => {
 
-  res.json({
+    res.json({
 
-    render: true,
+        render: true,
 
-    esp32Connected:
-      !!esp32
+        esp32Connected:
+            !!esp32
 
-  });
+    });
 
 });
 
 
 // ========================================
-// START SERVER
+// START
 // ========================================
 
 const PORT =
-  process.env.PORT || 3000;
+    process.env.PORT || 3000;
 
-server.listen(PORT, () => {
 
-  console.log(
-    `Server running on port ${PORT}`
-  );
+server.listen(
+    PORT,
+    () => {
 
-});
+        console.log(
+            `Server running on port ${PORT}`
+        );
+
+    }
+);
