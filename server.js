@@ -18,6 +18,14 @@ const wss = new WebSocket.Server({
 let esp32 = null;
 const pending = new Map();
 
+// Serialize HTTP requests through the single WebServer instance on the ESP32.
+// A browser refresh can create many parallel requests (HTML/CSS/JS/images).
+// The ESP32 can safely process only one tunnel request at a time, so Render
+// queues them instead of sending "ESP32 tunnel is busy" responses.
+const espQueue = [];
+let espBusy = false;
+let activeEspJob = null;
+
 // WebSocket heartbeat/health tracking.
 const HEARTBEAT_INTERVAL = 30000;
 const HEARTBEAT_TIMEOUT = 10000;
@@ -32,24 +40,106 @@ function clearPending(id) {
     return item;
 }
 
+function finishEspJob(id) {
+    if (activeEspJob && activeEspJob.id === id) {
+        activeEspJob = null;
+        espBusy = false;
+
+        pumpEspQueue();
+    }
+}
+
 function failPending(id, status, message) {
     const item = clearPending(id);
 
-    if (!item) return;
+    if (!item) {
+        finishEspJob(id);
+        return;
+    }
 
     if (!item.res.headersSent) {
-        item.res
-            .status(status)
-            .send(message);
+        item.res.status(status).send(message);
     } else {
         try {
             item.res.end();
         } catch {}
     }
+
+    finishEspJob(id);
+}
+
+function queueEspJob(job) {
+    espQueue.push(job);
+    pumpEspQueue();
+}
+
+async function pumpEspQueue() {
+    if (espBusy) {
+        return;
+    }
+
+    if (
+        !esp32 ||
+        esp32.readyState !== WebSocket.OPEN
+    ) {
+        return;
+    }
+
+    while (espQueue.length > 0) {
+        const job = espQueue.shift();
+
+        if (!job) {
+            return;
+        }
+
+        if (!pending.has(job.id)) {
+            continue;
+        }
+
+        espBusy = true;
+        activeEspJob = job;
+
+        try {
+            await job.send(esp32);
+        } catch (error) {
+            console.error(
+                "[WS] Failed to send queued job:",
+                error.message
+            );
+
+            failPending(
+                job.id,
+                502,
+                "Failed to send request to ESP32"
+            );
+        }
+
+        // Normal jobs release the ESP slot when their response arrives.
+        // If the job failed here, failPending() already released it.
+        if (
+            activeEspJob &&
+            activeEspJob.id === job.id
+        ) {
+            return;
+        }
+
+        if (
+            !esp32 ||
+            esp32.readyState !== WebSocket.OPEN
+        ) {
+            return;
+        }
+
+        if (espBusy) {
+            return;
+        }
+    }
 }
 
 function sendPendingResponse(id, item, body) {
-    if (!item || item.finished) return;
+    if (!item || item.finished) {
+        return;
+    }
 
     item.finished = true;
 
@@ -58,10 +148,7 @@ function sendPendingResponse(id, item, body) {
 
     const headers = item.headers || {};
 
-    for (
-        const [key, value]
-        of Object.entries(headers)
-    ) {
+    for (const [key, value] of Object.entries(headers)) {
         const lower = key.toLowerCase();
 
         if (
@@ -106,8 +193,7 @@ function sendPendingResponse(id, item, body) {
 
     item.res.setHeader(
         "Cache-Control",
-        headers["cache-control"] ||
-        "no-store"
+        headers["cache-control"] || "no-store"
     );
 
     const statusCode =
@@ -125,47 +211,43 @@ function sendPendingResponse(id, item, body) {
     item.res
         .status(statusCode)
         .end(body);
+
+    finishEspJob(id);
 }
 
 function sendWs(ws, payload) {
-    return new Promise(
-        (resolve, reject) => {
-            if (
-                !ws ||
-                ws.readyState !==
-                    WebSocket.OPEN
-            ) {
-                reject(
-                    new Error(
-                        "ESP32 WebSocket is not connected"
-                    )
-                );
-
-                return;
-            }
-
-            ws.send(
-                JSON.stringify(payload),
-                (err) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve();
-                    }
-                }
+    return new Promise((resolve, reject) => {
+        if (
+            !ws ||
+            ws.readyState !== WebSocket.OPEN
+        ) {
+            reject(
+                new Error(
+                    "ESP32 WebSocket is not connected"
+                )
             );
+
+            return;
         }
-    );
+
+        ws.send(
+            JSON.stringify(payload),
+            (err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve();
+                }
+            }
+        );
+    });
 }
 
-// ============================================================
-// MULTIPART FILE PARSER
-// ============================================================
-//
-// Used by the existing /upload form.
-// Render extracts the file before sending it to ESP32.
-//
-// ============================================================
+// ------------------------------------------------------------
+// Multipart parser for the existing /upload form.
+// The ESP32's normal local /upload route is untouched.
+// Cloud uploads use a dedicated WebSocket file-transfer path.
+// ------------------------------------------------------------
 
 function parseMultipartFile(
     body,
@@ -178,10 +260,9 @@ function parseMultipartFile(
     }
 
     const match =
-        /boundary=(?:"([^"]+)"|([^;]+))/i
-            .exec(
-                contentType || ""
-            );
+        /boundary=(?:"([^"]+)"|([^;]+))/i.exec(
+            contentType || ""
+        );
 
     if (!match) {
         throw new Error(
@@ -212,8 +293,7 @@ function parseMultipartFile(
                     partStart,
                     partStart + 2
                 )
-                .toString() ===
-            "--"
+                .toString() === "--"
         ) {
             break;
         }
@@ -222,10 +302,8 @@ function parseMultipartFile(
             partStart;
 
         if (
-            body[headerStart] ===
-                0x0d &&
-            body[headerStart + 1] ===
-                0x0a
+            body[headerStart] === 0x0d &&
+            body[headerStart + 1] === 0x0a
         ) {
             headerStart += 2;
         }
@@ -253,18 +331,18 @@ function parseMultipartFile(
                 .toString("utf8");
 
         const disposition =
-            /content-disposition:\s*([^\r\n]+)/i
-                .exec(
-                    headersText
-                );
+            /content-disposition:\s*([^\r\n]+)/i.exec(
+                headersText
+            );
 
         if (disposition) {
             const value =
                 disposition[1];
 
             const filenameMatch =
-                /filename="([^"]*)"/i
-                    .exec(value);
+                /filename="([^"]*)"/i.exec(
+                    value
+                );
 
             if (filenameMatch) {
                 const filename =
@@ -281,9 +359,7 @@ function parseMultipartFile(
                         dataStart
                     );
 
-                if (
-                    nextBoundary < 0
-                ) {
+                if (nextBoundary < 0) {
                     throw new Error(
                         "Multipart closing boundary not found"
                     );
@@ -314,10 +390,6 @@ function parseMultipartFile(
     );
 }
 
-// ============================================================
-// CLOUD UPLOAD
-// ============================================================
-
 async function handleCloudUpload(
     req,
     res
@@ -330,8 +402,7 @@ async function handleCloudUpload(
 
     if (
         !esp32 ||
-        esp32.readyState !==
-            WebSocket.OPEN
+        esp32.readyState !== WebSocket.OPEN
     ) {
         return res
             .status(503)
@@ -357,9 +428,8 @@ async function handleCloudUpload(
         file =
             parseMultipartFile(
                 req.body,
-                req.headers[
-                    "content-type"
-                ] || ""
+                req.headers["content-type"] ||
+                    ""
             );
     } catch (error) {
         console.error(
@@ -369,9 +439,7 @@ async function handleCloudUpload(
 
         return res
             .status(400)
-            .send(
-                error.message
-            );
+            .send(error.message);
     }
 
     const id =
@@ -385,135 +453,114 @@ async function handleCloudUpload(
         );
 
     const timer =
-        setTimeout(
-            () => {
-                const item =
-                    pending.get(id);
+        setTimeout(() => {
+            const item =
+                pending.get(id);
 
-                if (!item) {
-                    return;
-                }
-
-                pending.delete(id);
-
-                if (!res.headersSent) {
-                    res
-                        .status(504)
-                        .send(
-                            "ESP32 upload timeout"
-                        );
-                }
-
-                console.log(
-                    "[CLOUD UPLOAD] Timeout:",
-                    id
-                );
-            },
-            60000
-        );
-
-    pending.set(
-        id,
-        {
-            res,
-            timer,
-            finished: false,
-            statusCode: 200,
-            headers: {},
-            chunks: []
-        }
-    );
-
-    try {
-        console.log(
-            "[CLOUD UPLOAD] File:",
-            file.filename,
-            "bytes:",
-            file.data.length
-        );
-
-        // Start upload on ESP32.
-        await sendWs(
-            esp32,
-            {
-                type:
-                    "upload_start",
-
-                id,
-
-                filename:
-                    file.filename,
-
-                cookie
+            if (!item) {
+                return;
             }
-        );
 
-        // Keep chunks small enough
-        // for ESP32 memory.
-        const CHUNK_SIZE = 768;
+            pending.delete(id);
 
-        let sequence = 0;
+            finishEspJob(id);
 
-        for (
-            let offset = 0;
-            offset < file.data.length;
-            offset += CHUNK_SIZE
-        ) {
-            const chunk =
-                file.data.slice(
-                    offset,
-                    Math.min(
-                        offset +
-                            CHUNK_SIZE,
-                        file.data.length
-                    )
-                );
+            if (!res.headersSent) {
+                res
+                    .status(504)
+                    .send(
+                        "ESP32 upload timeout"
+                    );
+            }
+
+            console.log(
+                "[CLOUD UPLOAD] Timeout:",
+                id
+            );
+        }, 60000);
+
+    pending.set(id, {
+        res,
+        timer,
+        finished: false,
+        statusCode: 200,
+        headers: {},
+        chunks: []
+    });
+
+    // Queue the complete upload transfer so a browser refresh cannot
+    // interleave upload messages with another HTTP request.
+    queueEspJob({
+        id,
+        kind: "upload",
+
+        async send(ws) {
+            console.log(
+                "[CLOUD UPLOAD] File:",
+                file.filename,
+                "bytes:",
+                file.data.length
+            );
 
             await sendWs(
-                esp32,
+                ws,
                 {
-                    type:
-                        "upload_chunk",
-
+                    type: "upload_start",
                     id,
+                    filename:
+                        file.filename,
+                    cookie
+                }
+            );
 
-                    seq:
-                        sequence++,
+            // Keep chunks small enough
+            // for ESP32 WebSocket memory.
+            const CHUNK_SIZE = 768;
 
-                    body:
-                        chunk.toString(
-                            "base64"
+            let sequence = 0;
+
+            for (
+                let offset = 0;
+                offset < file.data.length;
+                offset += CHUNK_SIZE
+            ) {
+                const chunk =
+                    file.data.slice(
+                        offset,
+                        Math.min(
+                            offset +
+                                CHUNK_SIZE,
+                            file.data.length
                         )
+                    );
+
+                await sendWs(
+                    ws,
+                    {
+                        type:
+                            "upload_chunk",
+                        id,
+                        seq:
+                            sequence++,
+                        body:
+                            chunk.toString(
+                                "base64"
+                            )
+                    }
+                );
+            }
+
+            await sendWs(
+                ws,
+                {
+                    type: "upload_end",
+                    id,
+                    totalBytes:
+                        file.data.length
                 }
             );
         }
-
-        // Tell ESP32 the upload is complete.
-        await sendWs(
-            esp32,
-            {
-                type:
-                    "upload_end",
-
-                id,
-
-                totalBytes:
-                    file.data.length
-            }
-        );
-
-    } catch (error) {
-        console.error(
-            "[CLOUD UPLOAD] Transfer error:",
-            error.message
-        );
-
-        failPending(
-            id,
-            502,
-            "Failed to send upload to ESP32"
-        );
-    }
+    });
 }
 
 // ============================================================
@@ -528,8 +575,7 @@ wss.on(
         );
 
         ws.isAlive = true;
-        ws.lastHeartbeat =
-            Date.now();
+        ws.lastHeartbeat = Date.now();
 
         ws.on(
             "message",
@@ -550,18 +596,39 @@ wss.on(
                         );
                     }
 
-                    // =================================================
-                    // ESP32 REGISTRATION
-                    // =================================================
+                    // ------------------------------------------------
+                    // ESP32 registration
+                    // ------------------------------------------------
 
                     if (
-                        data.type ===
-                        "esp32"
+                        data.type === "esp32"
                     ) {
+                        // Replace an older connection safely.
+                        // Do not let the old socket's asynchronous
+                        // "close" event cancel requests that are now
+                        // being handled by the new socket.
                         if (
                             esp32 &&
                             esp32 !== ws
                         ) {
+                            console.log(
+                                "[WS] Replacing old ESP32 connection"
+                            );
+
+                            if (
+                                activeEspJob
+                            ) {
+                                espQueue.unshift(
+                                    activeEspJob
+                                );
+
+                                activeEspJob =
+                                    null;
+
+                                espBusy =
+                                    false;
+                            }
+
                             try {
                                 esp32.close();
                             } catch {}
@@ -580,12 +647,22 @@ wss.on(
                             })
                         );
 
+                        pumpEspQueue();
+
                         return;
                     }
 
-                    // =================================================
-                    // APPLICATION HEARTBEAT
-                    // =================================================
+                    // Ignore application messages
+                    // from a superseded connection.
+                    if (
+                        esp32 !== ws
+                    ) {
+                        return;
+                    }
+
+                    // ------------------------------------------------
+                    // Application heartbeat
+                    // ------------------------------------------------
 
                     if (
                         data.type ===
@@ -599,14 +676,14 @@ wss.on(
 
                         try {
                             ws.send(
-                                JSON.stringify(
-                                    {
-                                        type:
-                                            "heartbeat_ack"
-                                    }
-                                )
+                                JSON.stringify({
+                                    type:
+                                        "heartbeat_ack"
+                                })
                             );
-                        } catch (err) {
+                        } catch (
+                            err
+                        ) {
                             console.error(
                                 "[WS] Heartbeat ACK failed:",
                                 err.message
@@ -616,9 +693,9 @@ wss.on(
                         return;
                     }
 
-                    // =================================================
-                    // LEGACY RESPONSE
-                    // =================================================
+                    // ------------------------------------------------
+                    // Legacy response
+                    // ------------------------------------------------
 
                     if (
                         data.type ===
@@ -671,9 +748,9 @@ wss.on(
                         return;
                     }
 
-                    // =================================================
-                    // CHUNKED RESPONSE START
-                    // =================================================
+                    // ------------------------------------------------
+                    // Chunked response START
+                    // ------------------------------------------------
 
                     if (
                         data.type ===
@@ -710,12 +787,8 @@ wss.on(
                                 : -1;
 
                         item.chunks = [];
-
-                        item.receivedBytes =
-                            0;
-
-                        item.finished =
-                            false;
+                        item.receivedBytes = 0;
+                        item.finished = false;
 
                         console.log(
                             "[TUNNEL] Response start",
@@ -729,9 +802,9 @@ wss.on(
                         return;
                     }
 
-                    // =================================================
-                    // CHUNKED RESPONSE DATA
-                    // =================================================
+                    // ------------------------------------------------
+                    // Chunked response DATA
+                    // ------------------------------------------------
 
                     if (
                         data.type ===
@@ -783,9 +856,9 @@ wss.on(
                         return;
                     }
 
-                    // =================================================
-                    // CHUNKED RESPONSE END
-                    // =================================================
+                    // ------------------------------------------------
+                    // Chunked response END
+                    // ------------------------------------------------
 
                     if (
                         data.type ===
@@ -832,8 +905,9 @@ wss.on(
 
                         return;
                     }
-
-                } catch (error) {
+                } catch (
+                    error
+                ) {
                     console.error(
                         "[WS] Message processing error:",
                         error.message
@@ -842,20 +916,12 @@ wss.on(
             }
         );
 
-        // =========================================================
-        // PONG
-        // =========================================================
-
         ws.on(
             "pong",
             () => {
                 ws.isAlive = true;
             }
         );
-
-        // =========================================================
-        // CLOSE
-        // =========================================================
 
         ws.on(
             "close",
@@ -864,43 +930,44 @@ wss.on(
                     "[WS] ESP32 socket closed"
                 );
 
+                // This can be an old socket that was intentionally
+                // replaced by a newly registered ESP32. In that case,
+                // do nothing to the current connection or its
+                // pending requests.
                 if (
-                    esp32 === ws
+                    esp32 !== ws
                 ) {
-                    esp32 = null;
+                    return;
                 }
 
-                for (
-                    const [
-                        id,
-                        item
-                    ]
-                    of pending.entries()
+                esp32 = null;
+
+                // Keep queued/pending browser requests alive while
+                // ESP32 reconnects.
+                //
+                // The request timers still provide an upper bound.
+                // The active job is returned to the front so the new
+                // ESP32 connection can retry it.
+                if (
+                    activeEspJob
                 ) {
-                    clearTimeout(
-                        item.timer
+                    espQueue.unshift(
+                        activeEspJob
                     );
 
-                    if (
-                        !item.res.headersSent
-                    ) {
-                        item.res
-                            .status(503)
-                            .send(
-                                "ESP32 disconnected"
-                            );
-                    }
-
-                    pending.delete(
-                        id
-                    );
+                    activeEspJob =
+                        null;
                 }
+
+                espBusy = false;
+
+                console.log(
+                    "[WS] Waiting for ESP32 reconnect; queued requests preserved"
+                );
+
+                pumpEspQueue();
             }
         );
-
-        // =========================================================
-        // ERROR
-        // =========================================================
 
         ws.on(
             "error",
@@ -945,12 +1012,13 @@ const heartbeatTimer =
                         return;
                     }
 
-                    ws.isAlive =
-                        false;
+                    ws.isAlive = false;
 
                     try {
                         ws.ping();
-                    } catch (err) {
+                    } catch (
+                        err
+                    ) {
                         console.error(
                             "[WS] Ping failed:",
                             err.message
@@ -992,10 +1060,6 @@ app.get(
     }
 );
 
-// ============================================================
-// HEALTH
-// ============================================================
-
 app.get(
     "/health",
     (req, res) => {
@@ -1022,11 +1086,8 @@ app.use(
 );
 
 // ============================================================
-// CLOUD UPLOAD
-// ============================================================
-//
-// This route MUST come before the normal catch-all proxy.
-//
+// EXISTING CLOUD UPLOAD
+// Must be checked before the normal HTTP -> ESP32 proxy.
 // ============================================================
 
 app.post(
@@ -1080,24 +1141,18 @@ app.use(
                 );
         }
 
-        // --------------------------------------------------------
-        // Request ID
-        // --------------------------------------------------------
-
         const id =
             `${Date.now()}-${Math.random()
                 .toString(36)
                 .slice(2, 10)}`;
 
-        // --------------------------------------------------------
-        // Forward important headers
-        // --------------------------------------------------------
-
         const headers = {};
 
         for (
-            const [key, value]
-            of Object.entries(
+            const [
+                key,
+                value
+            ] of Object.entries(
                 req.headers
             )
         ) {
@@ -1105,16 +1160,26 @@ app.use(
                 key.toLowerCase();
 
             if (
-                lower === "cookie" ||
-                lower === "content-type" ||
-                lower === "content-length" ||
-                lower === "x-api-key" ||
-                lower === "authorization" ||
-                lower === "user-agent" ||
-                lower === "accept" ||
-                lower === "accept-language" ||
-                lower === "referer" ||
-                lower === "origin"
+                lower ===
+                    "cookie" ||
+                lower ===
+                    "content-type" ||
+                lower ===
+                    "content-length" ||
+                lower ===
+                    "x-api-key" ||
+                lower ===
+                    "authorization" ||
+                lower ===
+                    "user-agent" ||
+                lower ===
+                    "accept" ||
+                lower ===
+                    "accept-language" ||
+                lower ===
+                    "referer" ||
+                lower ===
+                    "origin"
             ) {
                 headers[lower] =
                     Array.isArray(
@@ -1123,13 +1188,11 @@ app.use(
                         ? value.join(
                               ", "
                           )
-                        : String(value);
+                        : String(
+                              value
+                          );
             }
         }
-
-        // --------------------------------------------------------
-        // Body -> Base64
-        // --------------------------------------------------------
 
         let body = "";
 
@@ -1145,10 +1208,6 @@ app.use(
                     "base64"
                 );
         }
-
-        // --------------------------------------------------------
-        // Timeout
-        // --------------------------------------------------------
 
         const timer =
             setTimeout(
@@ -1166,6 +1225,10 @@ app.use(
                         id
                     );
 
+                    finishEspJob(
+                        id
+                    );
+
                     if (
                         !res.headersSent
                     ) {
@@ -1178,10 +1241,6 @@ app.use(
                 },
                 30000
             );
-
-        // --------------------------------------------------------
-        // Save pending request
-        // --------------------------------------------------------
 
         pending.set(
             id,
@@ -1196,10 +1255,6 @@ app.use(
             }
         );
 
-        // --------------------------------------------------------
-        // Message to ESP32
-        // --------------------------------------------------------
-
         const message = {
             type: "request",
             id,
@@ -1211,49 +1266,25 @@ app.use(
             body
         };
 
-        // --------------------------------------------------------
-        // Send WebSocket message
-        // --------------------------------------------------------
+        queueEspJob({
+            id,
+            kind: "request",
 
-        try {
-            esp32.send(
-                JSON.stringify(
+            async send(ws) {
+                await sendWs(
+                    ws,
                     message
-                )
-            );
+                );
 
-            console.log(
-                "[WS] Request sent:",
-                req.method,
-                req.originalUrl,
-                "id:",
-                id
-            );
-
-        } catch (error) {
-            clearTimeout(
-                timer
-            );
-
-            pending.delete(
-                id
-            );
-
-            console.error(
-                "[WS] Failed to send request:",
-                error.message
-            );
-
-            if (
-                !res.headersSent
-            ) {
-                res
-                    .status(502)
-                    .send(
-                        "Failed to send request to ESP32"
-                    );
+                console.log(
+                    "[WS] Request sent:",
+                    req.method,
+                    req.originalUrl,
+                    "id:",
+                    id
+                );
             }
-        }
+        });
     }
 );
 
@@ -1262,8 +1293,7 @@ app.use(
 // ============================================================
 
 const PORT =
-    process.env.PORT ||
-    3000;
+    process.env.PORT || 3000;
 
 server.listen(
     PORT,
@@ -1289,10 +1319,6 @@ server.listen(
         );
     }
 );
-
-// ============================================================
-// PROCESS ERROR HANDLING
-// ============================================================
 
 process.on(
     "uncaughtException",
