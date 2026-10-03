@@ -3,7 +3,6 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const app = express();
-
 const server = http.createServer(app);
 
 const wss = new WebSocket.Server({
@@ -12,8 +11,7 @@ const wss = new WebSocket.Server({
 });
 
 let esp32 = null;
-
-let pendingRequest = null;
+const pending = new Map();
 
 
 // ========================================
@@ -22,8 +20,7 @@ let pendingRequest = null;
 
 wss.on("connection", (ws) => {
 
-    console.log("WebSocket client connected");
-
+    console.log("[WS] ESP32 socket connected");
 
     ws.on("message", (message) => {
 
@@ -32,23 +29,19 @@ wss.on("connection", (ws) => {
             const data =
                 JSON.parse(message.toString());
 
-
             console.log(
-                "ESP32 -> Render:",
+                "[ESP32 -> RENDER]",
                 data.type
             );
 
 
-            // -----------------------------
-            // ESP32 REGISTER
-            // -----------------------------
-
+            // ESP32 registration
             if (data.type === "esp32") {
 
                 esp32 = ws;
 
                 console.log(
-                    "ESP32 registered"
+                    "[WS] ESP32 registered"
                 );
 
                 ws.send(
@@ -61,47 +54,71 @@ wss.on("connection", (ws) => {
             }
 
 
-            // -----------------------------
-            // HTTP RESPONSE
-            // -----------------------------
+            // HTTP response from ESP32
+            if (data.type === "response") {
 
-            if (
-                data.type === "http_response"
-            ) {
+                const request =
+                    pending.get(data.id);
 
-                console.log(
-                    "HTTP response received from ESP32"
-                );
+                if (!request) {
 
-
-                if (
-                    pendingRequest
-                ) {
-
-                    const request =
-                        pendingRequest;
-
-                    pendingRequest = null;
-
-
-                    resSend(
-                        request.res,
-                        data
+                    console.log(
+                        "[WS] Unknown response ID:",
+                        data.id
                     );
+
+                    return;
                 }
 
-                return;
-            }
+                pending.delete(data.id);
+
+                const statusCode =
+                    data.statusCode || 200;
+
+                const headers =
+                    data.headers || {};
+
+                const body =
+                    Buffer.from(
+                        data.body || "",
+                        "base64"
+                    );
 
 
-            // -----------------------------
-            // PONG
-            // -----------------------------
+                // Forward headers
+                for (
+                    const [key, value]
+                    of Object.entries(headers)
+                ) {
 
-            if (data.type === "pong") {
+                    if (
+                        key.toLowerCase() ===
+                        "content-length"
+                    ) {
+                        continue;
+                    }
+
+                    try {
+                        request.res.set(
+                            key,
+                            value
+                        );
+                    }
+                    catch {}
+                }
+
+
+                request.res.status(
+                    statusCode
+                );
+
+                request.res.end(body);
 
                 console.log(
-                    "Pong received"
+                    "[HTTP] Response:",
+                    statusCode,
+                    "bytes:",
+                    body.length
                 );
 
                 return;
@@ -110,11 +127,8 @@ wss.on("connection", (ws) => {
         }
         catch (error) {
 
-            console.log(
-                "Invalid WebSocket message"
-            );
-
-            console.log(
+            console.error(
+                "[WS] Message error:",
                 error.message
             );
         }
@@ -125,17 +139,31 @@ wss.on("connection", (ws) => {
     ws.on("close", () => {
 
         console.log(
-            "WebSocket disconnected"
+            "[WS] ESP32 disconnected"
         );
 
-
         if (esp32 === ws) {
-
             esp32 = null;
+        }
 
-            console.log(
-                "ESP32 disconnected"
-            );
+        // Fail pending requests
+        for (
+            const [id, request]
+            of pending
+        ) {
+
+            try {
+
+                request.res
+                    .status(503)
+                    .send(
+                        "ESP32 disconnected"
+                    );
+
+            }
+            catch {}
+
+            pending.delete(id);
         }
 
     });
@@ -144,230 +172,221 @@ wss.on("connection", (ws) => {
 
 
 // ========================================
-// SEND RESPONSE TO BROWSER
+// PROXY ALL HTTP REQUESTS TO ESP32
 // ========================================
 
-function resSend(res, data) {
-
-    const status =
-        data.status || 200;
-
-
-    const contentType =
-        data.contentType ||
-        "text/plain";
+app.use(
+    express.raw({
+        type: "*/*",
+        limit: "2mb"
+    })
+);
 
 
-    res.status(status);
-
-    res.set(
-        "Content-Type",
-        contentType
-    );
-
-
-    res.send(
-        data.body || ""
-    );
-}
-
-
-// ========================================
-// HOME PAGE
-// ========================================
-
-app.get("/", (req, res) => {
-
-    res.send(`
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<title>ESP32 Cloud Tunnel</title>
-
-<style>
-
-body {
-    background:#111;
-    color:white;
-    font-family:Arial;
-    text-align:center;
-    padding:50px;
-}
-
-button {
-    padding:15px 30px;
-    font-size:18px;
-    cursor:pointer;
-}
-
-#result {
-    margin-top:30px;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<h1>ESP32 Cloud Tunnel</h1>
-
-<p>
-Render → ESP32 Loopback Test
-</p>
-
-<button onclick="test()">
-Test ESP32 HTTP
-</button>
-
-<div id="result">
-Waiting...
-</div>
-
-<script>
-
-async function test() {
-
-    const result =
-        document.getElementById("result");
-
-    result.innerHTML =
-        "Requesting ESP32...";
-
-    try {
-
-        const response =
-            await fetch("/esp32-test");
-
-        const html =
-            await response.text();
-
-        result.innerHTML = html;
-
-    }
-    catch(error) {
-
-        result.innerHTML =
-            "ERROR: " + error;
-
-    }
-
-}
-
-</script>
-
-</body>
-
-</html>
-`);
-
-});
-
-
-// ========================================
-// ESP32 LOOPBACK TEST
-// ========================================
-
-app.get("/esp32-test", (req, res) => {
+app.use(async (req, res) => {
 
     console.log(
-        "Browser requested ESP32"
+        "[HTTP]",
+        req.method,
+        req.originalUrl
     );
 
 
-    // Check ESP32
-    if (!esp32) {
-
-        return res.status(503).send(
-            "ESP32 is not connected"
-        );
-
+    // Don't proxy the tunnel itself
+    if (
+        req.path === "/tunnel"
+    ) {
+        return res.status(404).end();
     }
 
 
-    // Prevent multiple requests
-    if (pendingRequest) {
+    // ESP32 must be connected
+    if (
+        !esp32 ||
+        esp32.readyState !== WebSocket.OPEN
+    ) {
 
-        return res.status(429).send(
-            "Another request is already running"
-        );
-
+        return res
+            .status(503)
+            .send(
+                "ESP32 is not connected"
+            );
     }
 
 
-    pendingRequest = {
-        res: res
-    };
+    const id =
+        `${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2, 8)}`;
 
 
     // ------------------------------------
-    // SEND LOOPBACK TEST TO ESP32
+    // Headers
+    // ------------------------------------
+
+    const headers = {};
+
+
+    for (
+        const [key, value]
+        of Object.entries(req.headers)
+    ) {
+
+        const lower =
+            key.toLowerCase();
+
+
+        // Only forward useful headers
+        if (
+            lower === "cookie" ||
+            lower === "x-api-key" ||
+            lower === "content-type" ||
+            lower === "user-agent" ||
+            lower === "authorization"
+        ) {
+
+            headers[lower] =
+                Array.isArray(value)
+                    ? value.join(", ")
+                    : value;
+        }
+
+    }
+
+
+    // ------------------------------------
+    // Body
+    // ------------------------------------
+
+    let body = "";
+
+    if (
+        req.body &&
+        Buffer.isBuffer(req.body)
+    ) {
+
+        body =
+            req.body.toString("base64");
+    }
+
+
+    // ------------------------------------
+    // Path
+    // ------------------------------------
+
+    const path =
+        req.originalUrl;
+
+
+    // ------------------------------------
+    // Store request
+    // ------------------------------------
+
+    pending.set(id, {
+        res,
+        timer: null
+    });
+
+
+    // ------------------------------------
+    // Timeout
+    // ------------------------------------
+
+    const timer =
+        setTimeout(() => {
+
+            const request =
+                pending.get(id);
+
+            if (!request) {
+                return;
+            }
+
+            pending.delete(id);
+
+            if (!res.headersSent) {
+
+                res
+                    .status(504)
+                    .send(
+                        "ESP32 request timeout"
+                    );
+            }
+
+        }, 20000);
+
+
+    pending.get(id).timer = timer;
+
+
+    // ------------------------------------
+    // Send to ESP32
     // ------------------------------------
 
     const message = {
 
-        type: "loopback_test"
+        type: "request",
+
+        id,
+
+        method:
+            req.method,
+
+        path,
+
+        headers,
+
+        body
 
     };
 
 
     console.log(
-        "Render -> ESP32:",
-        message
+        "[RENDER -> ESP32]",
+        req.method,
+        path
     );
 
 
-    esp32.send(
-        JSON.stringify(message)
-    );
+    try {
 
+        esp32.send(
+            JSON.stringify(message)
+        );
 
-    // ------------------------------------
-    // TIMEOUT
-    // ------------------------------------
+    }
+    catch (error) {
 
-    setTimeout(() => {
+        clearTimeout(timer);
 
-        if (pendingRequest) {
+        pending.delete(id);
 
-            pendingRequest = null;
-
-            try {
-
-                res.status(504).send(
-                    "ESP32 response timeout"
-                );
-
-            }
-            catch (error) {
-
-                console.log(
-                    "Response already closed"
-                );
-            }
-
-        }
-
-    }, 15000);
+        return res
+            .status(502)
+            .send(
+                "Failed to send request to ESP32"
+            );
+    }
 
 });
 
 
 // ========================================
-// STATUS
+// RENDER STATUS
 // ========================================
 
-app.get("/api/status", (req, res) => {
+app.get("/cloud-status", (req, res) => {
 
     res.json({
 
         render: true,
 
         esp32Connected:
-            !!esp32
+            !!esp32 &&
+            esp32.readyState === WebSocket.OPEN,
+
+        pendingRequests:
+            pending.size
 
     });
 
@@ -375,12 +394,11 @@ app.get("/api/status", (req, res) => {
 
 
 // ========================================
-// START
+// SERVER
 // ========================================
 
 const PORT =
     process.env.PORT || 3000;
-
 
 server.listen(
     PORT,
