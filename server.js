@@ -146,9 +146,15 @@ function sendPendingResponse(id, item, body) {
                 Array.isArray(value) ? value.map(String) : [String(value)]
             );
         } else if (Array.isArray(value)) {
-            item.res.setHeader(key, value.map(String));
+            item.res.setHeader(
+                key,
+                value.map(String)
+            );
         } else {
-            item.res.setHeader(key, String(value));
+            item.res.setHeader(
+                key,
+                String(value)
+            );
         }
     }
 
@@ -409,6 +415,175 @@ async function handleCloudUpload(req, res) {
 }
 
 // ============================================================
+// CLOUD OTA
+// ============================================================
+// Browser sends POST /api/ota as multipart/form-data.
+// Render extracts the .bin and forwards it as small WebSocket
+// messages so the ESP32 never receives a huge base64 JSON payload.
+// ============================================================
+
+async function handleCloudOTA(req, res) {
+    console.log(
+        "[CLOUD OTA] Request:",
+        req.method,
+        req.originalUrl
+    );
+
+    if (
+        !esp32 ||
+        esp32.readyState !== WebSocket.OPEN
+    ) {
+        return res
+            .status(503)
+            .send("ESP32 is not connected");
+    }
+
+    if (
+        !req.body ||
+        !Buffer.isBuffer(req.body)
+    ) {
+        return res
+            .status(400)
+            .send("OTA upload body missing");
+    }
+
+    let file;
+
+    try {
+        file = parseMultipartFile(
+            req.body,
+            req.headers["content-type"] || ""
+        );
+    } catch (error) {
+        console.error(
+            "[CLOUD OTA] Multipart parse error:",
+            error.message
+        );
+
+        return res
+            .status(400)
+            .send(error.message);
+    }
+
+    const filename = String(
+        file.filename || "firmware.bin"
+    );
+
+    if (
+        !filename
+            .toLowerCase()
+            .endsWith(".bin")
+    ) {
+        return res
+            .status(400)
+            .send("Only .bin firmware files are accepted");
+    }
+
+    if (file.data.length === 0) {
+        return res
+            .status(400)
+            .send("Firmware file is empty");
+    }
+
+    const id =
+        `${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2, 10)}`;
+
+    const apiKey = String(
+        req.headers["x-api-key"] || ""
+    );
+
+    const timer = setTimeout(() => {
+        const item = pending.get(id);
+        if (!item) return;
+
+        pending.delete(id);
+        finishEspJob(id);
+
+        if (!res.headersSent) {
+            res
+                .status(504)
+                .send("ESP32 OTA timeout");
+        }
+
+        console.log(
+            "[CLOUD OTA] Timeout:",
+            id
+        );
+    }, 180000);
+
+    pending.set(id, {
+        res,
+        timer,
+        finished: false,
+        statusCode: 200,
+        headers: {},
+        chunks: []
+    });
+
+    queueEspJob({
+        id,
+        kind: "ota",
+
+        async send(ws) {
+            console.log(
+                "[CLOUD OTA] File:",
+                filename,
+                "bytes:",
+                file.data.length
+            );
+
+            // Send the size as a STRING because the ESP32's lightweight
+            // JSON parser reads quoted string values.
+            await sendWs(ws, {
+                type: "ota_start",
+                id,
+                filename,
+                apiKey,
+                totalBytes:
+                    String(file.data.length)
+            });
+
+            // 512 raw bytes -> ~684 base64 characters + JSON envelope.
+            // This stays comfortably below the WebSocket payload limit and
+            // keeps the ESP32 memory usage small.
+            const CHUNK_SIZE = 512;
+
+            let sequence = 0;
+
+            for (
+                let offset = 0;
+                offset < file.data.length;
+                offset += CHUNK_SIZE
+            ) {
+                const chunk = file.data.slice(
+                    offset,
+                    Math.min(
+                        offset + CHUNK_SIZE,
+                        file.data.length
+                    )
+                );
+
+                await sendWs(ws, {
+                    type: "ota_chunk",
+                    id,
+                    seq: sequence++,
+                    body: chunk.toString("base64")
+                });
+            }
+
+            await sendWs(ws, {
+                type: "ota_end",
+                id,
+                totalBytes:
+                    String(file.data.length)
+            });
+        }
+    });
+}
+
+// ============================================================
 // ESP32 WEBSOCKET
 // ============================================================
 
@@ -493,7 +668,6 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            // ------------------------------------------------
             // Legacy response
             // ------------------------------------------------
 
@@ -519,7 +693,6 @@ wss.on("connection", (ws) => {
 
                 item.statusCode =
                     Number(data.statusCode || 200);
-
                 item.headers =
                     data.headers || {};
 
@@ -542,17 +715,12 @@ wss.on("connection", (ws) => {
 
                 item.statusCode =
                     Number(data.statusCode || 200);
-
                 item.headers =
                     data.headers || {};
-
                 item.expectedLength =
-                    Number.isFinite(
-                        Number(data.expectedLength)
-                    )
+                    Number.isFinite(Number(data.expectedLength))
                         ? Number(data.expectedLength)
                         : -1;
-
                 item.chunks = [];
                 item.receivedBytes = 0;
                 item.finished = false;
@@ -575,13 +743,7 @@ wss.on("connection", (ws) => {
 
             if (data.type === "response_chunk") {
                 const item = pending.get(data.id);
-
-                if (
-                    !item ||
-                    item.finished
-                ) {
-                    return;
-                }
+                if (!item || item.finished) return;
 
                 let chunk;
 
@@ -613,13 +775,7 @@ wss.on("connection", (ws) => {
 
             if (data.type === "response_end") {
                 const item = pending.get(data.id);
-
-                if (
-                    !item ||
-                    item.finished
-                ) {
-                    return;
-                }
+                if (!item || item.finished) return;
 
                 const body = Buffer.concat(
                     item.chunks || []
@@ -1148,6 +1304,38 @@ app.post(
 );
 
 // ============================================================
+// CLOUD OTA ROUTE
+// Must be checked before the normal HTTP -> ESP32 proxy.
+// ============================================================
+
+app.post(
+    "/api/ota",
+    (req, res) => {
+        handleCloudOTA(
+            req,
+            res
+        ).catch(
+            (error) => {
+                console.error(
+                    "[CLOUD OTA] Unexpected error:",
+                    error
+                );
+
+                if (
+                    !res.headersSent
+                ) {
+                    res
+                        .status(500)
+                        .send(
+                            "OTA upload failed"
+                        );
+                }
+            }
+        );
+    }
+);
+
+// ============================================================
 // NORMAL HTTP -> ESP32 PROXY
 // ============================================================
 
@@ -1342,6 +1530,15 @@ server.listen(
 
         console.log(
             "Cloud upload endpoint: POST /upload"
+        );
+
+        console.log(
+            "Cloud OTA endpoint: POST /api/ota"
+        );
+
+        console.log(
+            "Maximum active visitors:",
+            MAX_ACTIVE_VISITORS
         );
 
         console.log(
