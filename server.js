@@ -5,484 +5,240 @@ const WebSocket = require("ws");
 const app = express();
 const server = http.createServer(app);
 
-const PORT = process.env.PORT || 3000;
-
-// ============================================================
-// ESP32 WEBSOCKET TUNNEL
-// ============================================================
-
 const wss = new WebSocket.Server({
-    server,
-    path: "/tunnel"
+  server,
+  path: "/tunnel"
 });
 
 let esp32 = null;
 
-// Request ID counter
-let requestCounter = 0;
-
-// Requests waiting for ESP32 responses
-const pendingRequests = new Map();
-
-// ============================================================
-// BASIC INFO
-// ============================================================
-
-app.get("/api/status", (req, res) => {
-
-    res.json({
-        server: "ESP32 Reverse Tunnel",
-        esp32Connected:
-            esp32 !== null &&
-            esp32.readyState === WebSocket.OPEN,
-        pendingRequests: pendingRequests.size,
-        time: new Date().toISOString()
-    });
-
-});
-
-// ============================================================
-// WEBSOCKET CONNECTION FROM ESP32
-// ============================================================
+// ========================================
+// ESP32 WEBSOCKET CONNECTION
+// ========================================
 
 wss.on("connection", (ws) => {
+  console.log("WebSocket client connected");
 
-    console.log("ESP32 tunnel connected");
+  ws.on("message", (message) => {
+    try {
+      const data = JSON.parse(message.toString());
 
-    // Disconnect previous ESP32
-    if (esp32) {
+      console.log("ESP32 -> Render:", data);
 
-        try {
-            esp32.close();
-        } catch (error) {}
+      // ESP32 identifies itself
+      if (data.type === "esp32") {
+        esp32 = ws;
 
+        console.log("ESP32 registered");
+
+        ws.send(JSON.stringify({
+          type: "registered",
+          message: "ESP32 connected successfully"
+        }));
+
+        return;
+      }
+
+      // Response from ESP32
+      if (data.type === "response") {
+        console.log("Response received from ESP32");
+
+        return;
+      }
+
+      // Pong from ESP32
+      if (data.type === "pong") {
+        console.log("Pong received from ESP32");
+        return;
+      }
+
+    } catch (error) {
+      console.log("Invalid message:", message.toString());
     }
+  });
 
-    esp32 = ws;
+  ws.on("close", () => {
+    console.log("WebSocket disconnected");
 
-    ws.send(JSON.stringify({
-        type: "connected",
-        message: "Tunnel established"
-    }));
-
-    // --------------------------------------------------------
-    // MESSAGE FROM ESP32
-    // --------------------------------------------------------
-
-    ws.on("message", (message) => {
-
-        try {
-
-            const data =
-                JSON.parse(message.toString());
-
-            console.log(
-                "ESP32 message:",
-                data.type
-            );
-
-            // ------------------------------------------------
-            // ESP32 RESPONSE
-            // ------------------------------------------------
-
-            if (
-                data.type === "response" &&
-                data.id
-            ) {
-
-                const pending =
-                    pendingRequests.get(data.id);
-
-                if (!pending) {
-                    console.log(
-                        "Unknown request ID:",
-                        data.id
-                    );
-                    return;
-                }
-
-                pendingRequests.delete(data.id);
-
-                clearTimeout(
-                    pending.timeout
-                );
-
-                // Send response back to browser
-                const statusCode =
-                    Number(data.statusCode) || 200;
-
-                const headers =
-                    data.headers || {};
-
-                // Decode response body
-                let body = Buffer.alloc(0);
-
-                if (data.body) {
-
-                    body =
-                        Buffer.from(
-                            data.body,
-                            "base64"
-                        );
-
-                }
-
-                resSafe(
-                    pending.res,
-                    statusCode,
-                    headers,
-                    body
-                );
-
-                return;
-            }
-
-        } catch (error) {
-
-            console.log(
-                "ESP32 message error:",
-                error.message
-            );
-
-        }
-
-    });
-
-    // --------------------------------------------------------
-    // DISCONNECT
-    // --------------------------------------------------------
-
-    ws.on("close", () => {
-
-        console.log(
-            "ESP32 tunnel disconnected"
-        );
-
-        if (esp32 === ws) {
-            esp32 = null;
-        }
-
-        // Fail all waiting requests
-        for (
-            const [id, pending]
-            of pendingRequests
-        ) {
-
-            clearTimeout(
-                pending.timeout
-            );
-
-            try {
-
-                pending.res
-                    .status(503)
-                    .send(
-                        "ESP32 disconnected"
-                    );
-
-            } catch (error) {}
-
-            pendingRequests.delete(id);
-        }
-
-    });
-
-    // --------------------------------------------------------
-    // ERROR
-    // --------------------------------------------------------
-
-    ws.on("error", (error) => {
-
-        console.log(
-            "ESP32 WebSocket error:",
-            error.message
-        );
-
-    });
-
+    if (esp32 === ws) {
+      esp32 = null;
+      console.log("ESP32 disconnected");
+    }
+  });
 });
 
-// ============================================================
-// SAFE HTTP RESPONSE
-// ============================================================
 
-function resSafe(
-    res,
-    statusCode,
-    headers,
-    body
-) {
+// ========================================
+// RENDER TEST PAGE
+// ========================================
 
-    if (res.headersSent) {
-        return;
-    }
+app.get("/", (req, res) => {
 
-    // Do not forward hop-by-hop headers
-    const blockedHeaders = new Set([
-        "connection",
-        "keep-alive",
-        "transfer-encoding",
-        "upgrade",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer"
-    ]);
-
-    for (
-        const [name, value]
-        of Object.entries(headers)
-    ) {
-
-        if (
-            blockedHeaders.has(
-                name.toLowerCase()
-            )
-        ) {
-            continue;
-        }
-
-        try {
-
-            res.setHeader(
-                name,
-                value
-            );
-
-        } catch (error) {}
-
-    }
-
-    res.status(statusCode);
-
-    res.send(body);
-}
-
-// ============================================================
-// CREATE REQUEST ID
-// ============================================================
-
-function createRequestID() {
-
-    requestCounter++;
-
-    return (
-        Date.now().toString(36) +
-        "-" +
-        requestCounter.toString(36)
-    );
-}
-
-// ============================================================
-// REQUEST BODY
-// ============================================================
-
-app.use(
-    express.raw({
-        type: "*/*",
-        limit: "20mb"
-    })
-);
-
-// ============================================================
-// PUBLIC HTTP → ESP32 PROXY
-// ============================================================
-
-app.use(async (req, res) => {
-
-    // --------------------------------------------------------
-    // CHECK ESP32
-    // --------------------------------------------------------
-
-    if (
-        !esp32 ||
-        esp32.readyState !== WebSocket.OPEN
-    ) {
-
-        return res.status(503).send(`
+  res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ESP32 Offline</title>
+    <title>ESP32 Cloud Relay</title>
+
+    <style>
+        body {
+            font-family: Arial;
+            background: #111;
+            color: white;
+            text-align: center;
+            padding: 50px;
+        }
+
+        .box {
+            max-width: 600px;
+            margin: auto;
+            background: #222;
+            padding: 30px;
+            border-radius: 15px;
+        }
+
+        button {
+            padding: 12px 25px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #000;
+            border-radius: 10px;
+        }
+    </style>
 </head>
 
-<body style="
-    background:#080c15;
-    color:white;
-    font-family:Arial;
-    text-align:center;
-    padding-top:100px;
-">
+<body>
 
-    <h1>ESP32 Offline</h1>
+<div class="box">
+
+    <h1>ESP32 Cloud Relay</h1>
 
     <p>
-        The ESP32 is not connected to the cloud tunnel.
+        Render Gateway Test
     </p>
 
-</body>
-</html>
-        `);
+    <button onclick="testESP32()">
+        Test ESP32
+    </button>
 
-    }
+    <div id="result">
+        Waiting...
+    </div>
 
-    // --------------------------------------------------------
-    // CREATE REQUEST ID
-    // --------------------------------------------------------
+</div>
 
-    const id =
-        createRequestID();
+<script>
 
-    // --------------------------------------------------------
-    // COPY REQUEST HEADERS
-    // --------------------------------------------------------
+async function testESP32() {
 
-    const headers = {};
+    const result =
+        document.getElementById("result");
 
-    for (
-        const [name, value]
-        of Object.entries(req.headers)
-    ) {
-
-        const lower =
-            name.toLowerCase();
-
-        // Skip headers that belong
-        // only to Render's connection
-        if (
-            lower === "host" ||
-            lower === "connection" ||
-            lower === "content-length"
-        ) {
-            continue;
-        }
-
-        headers[name] = value;
-
-    }
-
-    // --------------------------------------------------------
-    // REQUEST BODY
-    // --------------------------------------------------------
-
-    let bodyBase64 = "";
-
-    if (
-        req.body &&
-        Buffer.isBuffer(req.body) &&
-        req.body.length > 0
-    ) {
-
-        bodyBase64 =
-            req.body.toString("base64");
-
-    }
-
-    // --------------------------------------------------------
-    // REQUEST MESSAGE
-    // --------------------------------------------------------
-
-    const requestMessage = {
-
-        type: "request",
-
-        id: id,
-
-        method:
-            req.method,
-
-        path:
-            req.originalUrl,
-
-        headers:
-            headers,
-
-        body:
-            bodyBase64
-
-    };
-
-    // --------------------------------------------------------
-    // WAIT FOR ESP32 RESPONSE
-    // --------------------------------------------------------
-
-    const timeout =
-        setTimeout(() => {
-
-            if (
-                pendingRequests.has(id)
-            ) {
-
-                pendingRequests.delete(id);
-
-                if (
-                    !res.headersSent
-                ) {
-
-                    res
-                        .status(504)
-                        .send(
-                            "ESP32 request timeout"
-                        );
-
-                }
-
-            }
-
-        }, 30000);
-
-    pendingRequests.set(
-        id,
-        {
-            res: res,
-            timeout: timeout
-        }
-    );
-
-    // --------------------------------------------------------
-    // SEND REQUEST TO ESP32
-    // --------------------------------------------------------
+    result.innerText = "Testing...";
 
     try {
 
-        esp32.send(
-            JSON.stringify(
-                requestMessage
-            )
-        );
+        const response =
+            await fetch("/test");
 
-        console.log(
-            `${req.method} ${req.originalUrl} -> ESP32`
-        );
+        const text =
+            await response.text();
+
+        result.innerText = text;
 
     } catch (error) {
 
-        clearTimeout(timeout);
-
-        pendingRequests.delete(id);
-
-        return res
-            .status(502)
-            .send(
-                "Failed to send request to ESP32"
-            );
+        result.innerText =
+            "Error: " + error;
 
     }
+
+}
+
+</script>
+
+</body>
+</html>
+  `);
 
 });
 
-// ============================================================
+
+// ========================================
+// TEST ESP32 CONNECTION
+// ========================================
+
+app.get("/test", (req, res) => {
+
+  if (!esp32) {
+
+    return res.status(503).send(
+      "ESP32 is not connected to Render"
+    );
+
+  }
+
+  const requestId =
+    Date.now().toString();
+
+  const message = {
+
+    type: "test",
+
+    id: requestId
+
+  };
+
+  console.log(
+    "Render -> ESP32:",
+    message
+  );
+
+  esp32.send(
+    JSON.stringify(message)
+  );
+
+  res.send(
+    "Request sent to ESP32. Check ESP32 Serial Monitor."
+  );
+
+});
+
+
+// ========================================
+// STATUS
+// ========================================
+
+app.get("/api/status", (req, res) => {
+
+  res.json({
+
+    render: true,
+
+    esp32Connected:
+      !!esp32
+
+  });
+
+});
+
+
+// ========================================
 // START SERVER
-// ============================================================
+// ========================================
 
-server.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
+const PORT =
+  process.env.PORT || 3000;
 
-        console.log(
-            `ESP32 tunnel server running on port ${PORT}`
-        );
+server.listen(PORT, () => {
 
-    }
-);
+  console.log(
+    `Server running on port ${PORT}`
+  );
+
+});
