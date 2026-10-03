@@ -216,7 +216,7 @@ button {
 <h1>ESP32 Cloud Tunnel</h1>
 
 <p>
-Render → ESP32 HTTP Test
+Render → ESP32 Loopback Test
 </p>
 
 <button onclick="test()">
@@ -268,7 +268,7 @@ async function test() {
 
 
 // ========================================
-// ESP32 HTTP TEST
+// ESP32 LOOPBACK TEST
 // ========================================
 
 app.get("/esp32-test", (req, res) => {
@@ -303,11 +303,13 @@ app.get("/esp32-test", (req, res) => {
     };
 
 
-    // Send request to ESP32
+    // ------------------------------------
+    // SEND LOOPBACK TEST TO ESP32
+    // ------------------------------------
 
     const message = {
 
-        type: "http_test"
+        type: "loopback_test"
 
     };
 
@@ -323,7 +325,9 @@ app.get("/esp32-test", (req, res) => {
     );
 
 
-    // Timeout
+    // ------------------------------------
+    // TIMEOUT
+    // ------------------------------------
 
     setTimeout(() => {
 
